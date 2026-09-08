@@ -108,6 +108,7 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 - [Completions](docs/completions.md)
 - [Models](docs/models.md)
 - [Release process](docs/release.md)
+- [Qwen3.8-27B / RTX 5070 Ti hot-cold KV engineering study](docs/LOCAL-QWEN-BLACKWELL-STUDY.md)
 
 ## Contributing
 
@@ -118,12 +119,6 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 - Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
 
 ## Acknowledgements
-
-### Local Qwen3.8/Blackwell study
-
-The repository includes a sanitized, reproducible record of the local RTX 5070 Ti study, including the frozen UD-IQ4_XS profile, MTP3/state-restoration changes, build/run guidance, benchmark tables, and limitations:
-
-[`docs/LOCAL-QWEN-BLACKWELL-STUDY.md`](docs/LOCAL-QWEN-BLACKWELL-STUDY.md)
 
 - [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
 - [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
