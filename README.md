@@ -109,6 +109,7 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 - [Models](docs/models.md)
 - [Release process](docs/release.md)
 - [Qwen3.8-27B / RTX 5070 Ti hot-cold KV engineering study](docs/LOCAL-QWEN-BLACKWELL-STUDY.md)
+- [Complete Qwen3.8 Blackwell 256K source branch](https://github.com/BrunoPPassini/llama.cpp/tree/qwen38-blackwell-256k)
 
 ## Contributing
 

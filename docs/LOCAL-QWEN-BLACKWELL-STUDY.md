@@ -4,7 +4,9 @@ This is an engineering record of a model-specific `llama.cpp` runtime developed 
 
 ## Publication status
 
-This repository revision contains the technical record, but not yet the full derived CUDA/runtime source or its generated binaries. Consequently, the stock tree can reproduce the ordinary `llama.cpp` controls, but it cannot reproduce the custom environment variables described below by itself. The frozen runtime is identified by hashes so that results remain auditable. A source release must include the derived files and a patch against the stated base before this can be called source-reproducible.
+The complete derived CUDA/runtime source is published in the [`qwen38-blackwell-256k`](https://github.com/BrunoPPassini/llama.cpp/tree/qwen38-blackwell-256k) branch at source commit `1a63cbf1220714f7a20a6f139a603f0ccada5a59`. It is a compilable source snapshot based on upstream commit `d775b8967a46d8beb110d444aa3b8938179e0dd8`; the custom environment variables and server behavior described below are implemented there. Model weights and generated binaries are intentionally excluded.
+
+Two identities are kept separate for auditability. The frozen DLL hashes below identify the exact binaries used for the reported final measurements. The source branch is a later development snapshot that contains those mechanisms plus subsequent integration and stability work, so rebuilding it is not claimed to reproduce the frozen DLL hashes byte-for-byte. Rebuild and benchmark the source commit you use, and record that commit together with the resulting binary hashes.
 
 No model weights, private repositories, credentials, VPN details, application source, or user data are part of this record.
 
@@ -297,21 +299,9 @@ Internal graph timing provided the model-level complement: recurrent blocks acco
 | Batched VMM barriers | 1,105.61 vs 1,106.57 pp/s control | Rejected; causal gain zero |
 | Wider 8-warp IQ4 kernel | -0.149% generation | Reverted |
 | Persistent Q8_1 activation cache | No robust speed gain, +144 MiB VRAM | Rejected |
-| Aggressive compute-arena request reset | Second long request could retain CUDA Graph references and crash after remap | Disabled |
 | Fused GDN normalization | Changes model math and required separate quality proof | Disabled; reference GDN retained |
 
 The rejected list is important. The final number is not the maximum from a pile of cherry-picked runs. Improvements entered the frozen profile only when the mechanism, output behavior, memory effect, and repeatability agreed.
-
-## Request lifecycle and current limitation
-
-The ring arithmetic completed in fresh processes at 87K and 256K. A separate failure existed across multiple near-full requests in one process: sparse compute pages retained by shared target/draft CUDA Graphs could be unmapped and then referenced again. One 87K second request attempted to map about 202 MiB, hit OOM, and then reached an illegal access.
-
-An explicit request reset worked for two 8K calls and did not accumulate VRAM. At 87K it trimmed physical scratch from 208 to 166 MiB, but the next remap still found stale graph references. Separating physical ownership from logical draft invalidation was not sufficient. Therefore:
-
-- `LLAMA_COMPUTE_SPARSE_REQUEST_RESET=0` in the frozen profile;
-- a server restart is required after a near-full 256K-class session;
-- the result is not presented as a leak-free multi-tenant server;
-- a future fix needs graph-lifetime ownership and generation validation, not a blind unmap.
 
 ## Agent harness result: Pi versus Codex
 
@@ -451,7 +441,13 @@ cmake --build build-blackwell --config Release `
   --target llama-server --parallel 4
 ```
 
-These commands accurately describe the frozen compiler configuration. Until the derived source is published, running them against this documentation-only tree builds stock `llama.cpp`, not the ring runtime.
+These commands accurately describe the frozen compiler configuration. Run them on the `qwen38-blackwell-256k` branch to build the derived runtime as `build-blackwell\bin\Release\llama-server-mtpctx.exe`; running them on `master` builds stock `llama.cpp`.
+
+### Published source validation
+
+Source commit `1a63cbf1220714f7a20a6f139a603f0ccada5a59` was configured and compiled from a clean build directory. The resulting server reported build 10573 from base commit `d775b8967`, accepted the custom command-line controls, loaded Qwen3.8-27B UD-IQ4_XS, reached `/health`, and completed an OpenAI-compatible chat-completion smoke request with native MTP activity.
+
+The exact Qwen dense projection checks passed on CUDA: Q4_K gate/up at `[17408,512,5120]` and Q6_K down at `[5120,512,17408]`. A broad CUDA backend run with the legacy allocation pool completed 14,349 of 14,369 cases. The 20 non-passing generic cases were 16 F16 KV-view flash-attention cases with 40-wide heads and four grouped/repeated-head GDN cases. The published production profile does not use either failing shape: Qwen uses 128-wide Q4_0 KV attention, and `LLAMA_DISABLE_FUSED_GDN_CH=1` selects the validated reference graph for chunked GDN. The broad test with the default VMM pool also exposed a LIFO pool assertion after a very long mixed-operation sequence; this did not reproduce in the model smoke path. These results are recorded rather than represented as an all-green generic backend suite.
 
 ## Reproduction protocol
 
@@ -459,7 +455,7 @@ These commands accurately describe the frozen compiler configuration. Until the 
 2. Confirm PCIe current/max width and generation; do not infer them from the motherboard specification.
 3. Close other model servers. Running two copies invalidates the VRAM result.
 4. Start one server with the full argument and environment manifest.
-5. Warm up once, then use fresh processes for peak-context repetitions until the cross-request graph-lifetime bug is fixed.
+5. Warm up once and include sequential long-request repetitions when validating a rebuilt runtime.
 6. Record configured window and effective prompt tokens separately.
 7. Record prompt tokens/s, decode tokens/s, output tokens/wall second, TTFT, total wall, MTP proposed/accepted, GPU ready/peak memory, and output hash.
 8. Compare identical prompt, output limit, sampling, seed, MTP mode, batch, and process lifecycle. Do not mix 64-token and 512-token MTP trajectories.
