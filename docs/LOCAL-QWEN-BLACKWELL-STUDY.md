@@ -2,9 +2,21 @@
 
 This is an engineering record of a model-specific `llama.cpp` runtime developed for Qwen3.8-27B UD-IQ4_XS on one GeForce RTX 5070 Ti. The work is not a generic claim that host KV is fast or that every Blackwell GPU will reproduce these numbers. It documents the architecture, memory accounting, state machines, failed experiments, profiler evidence, and measured progression that led from a fast 64K-resident runtime to a 256K-capable hot/cold KV ring.
 
+## At a glance: measured before and after
+
+| Effective context regime | First controlled path | Accepted optimized path | Decode gain | Prefill effect |
+|---|---:|---:|---:|---:|
+| Short, GPU-resident | 1,888.63 pp/s, 42.11 tg/s | 1,745 pp/s, 82.34 tg/s | **+95.5%** | -7.6% |
+| Medium, 87,160 input + 64 output | 1,100.65 pp/s, 23.33 tg/s | 1,104.85 pp/s, 41.53 tg/s | **+78.0%** | +0.4% |
+| Long, 256,257 input + 64 output | 654.07 pp/s, 15.40 tg/s | 698.84 pp/s, 23.97 tg/s | **+55.6%** | +6.8% |
+
+These are endpoint comparisons, with the unsuccessful intermediate experiments intentionally omitted. The short row compares the target-only control with the isolated deterministic native-MTP3 path; it is not substituted for the 71.16 tg/s fully integrated daily reference reported later. The 87K row compares the first serial stateful ring with the final partitioned and pipelined ring; its accepted output hash and MTP counters matched. The 256K row compares the first viable P8 ring with the final copy/convert/attention and prefill pipelines; both runs used the same 64-token output protocol and produced the same output hash. There is no single stock-runtime baseline at all three depths because the unmodified all-device allocation cannot represent the filled 87K and 256K cases on 16 GB.
+
+The headline is therefore not "256K at short-context speed." The result is a nearly doubled controlled short decode path, a 78% faster 87K cold-ring decode, and a 55.6% faster fully occupied 256K decode while keeping exact attention and bounded device memory. Detailed protocols, limitations, and the distinction between allocated and effectively filled context follow below.
+
 ## Publication status
 
-The complete derived CUDA/runtime source is published in the [`qwen38-blackwell-256k`](https://github.com/BrunoPPassini/llama.cpp/tree/qwen38-blackwell-256k) branch at source commit `228a31715cbfe77358076a2d7bf64a3d315b96b4`. It is a compilable source snapshot based on upstream commit `d775b8967a46d8beb110d444aa3b8938179e0dd8`; the custom environment variables and server behavior described below are implemented there. Model weights and generated binaries are intentionally excluded.
+The complete derived CUDA/runtime source is published in the [`qwen38-blackwell-256k`](https://github.com/BrunoPPassini/llama.cpp/tree/qwen38-blackwell-256k) branch at source commit `daa7e974f5b702ba65acb06dbf030811b2d9df27`. It is a compilable source snapshot based on upstream commit `d775b8967a46d8beb110d444aa3b8938179e0dd8`; the custom environment variables and server behavior described below are implemented there. Model weights and generated binaries are intentionally excluded.
 
 Two identities are kept separate for auditability. The frozen DLL hashes below identify the exact binaries used for the reported final measurements. The source branch is a later development snapshot that contains those mechanisms plus subsequent integration and stability work, so rebuilding it is not claimed to reproduce the frozen DLL hashes byte-for-byte. Rebuild and benchmark the source commit you use, and record that commit together with the resulting binary hashes.
 
