@@ -71,6 +71,10 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
+    void set_recurrent_transaction(bool enabled) override;
+    bool recurrent_transaction_deferred() const override;
+    bool recurrent_transaction_accept(llama_seq_id seq_id, uint32_t n_keep, ggml_backend_t backend) override;
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;

@@ -28,6 +28,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -942,7 +943,7 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
     // generally, this will be done using the first device in the list
     // a better approach would be to handle this on a weight-by-weight basis using the offload_op
     // function of the device to determine if it would benefit from being stored in a host buffer
-    if (!no_host) {
+    if (!no_host && getenv("LLAMA_KV_MANAGED") == nullptr) {
         for (const auto & dev : devices) {
             ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev.dev);
             if (buft) {
@@ -2104,6 +2105,32 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
+    if (getenv("LLAMA_QWEN35_BLACKWELL_ENGINE") != nullptr) {
+        bool layer_pattern = true;
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            layer_pattern = layer_pattern && (hparams.is_recr(il) == ((il + 1) % 4 != 0));
+        }
+
+        ggml_backend_dev_t dev = dev_layer(0);
+        const std::string dev_desc = dev ? ggml_backend_dev_description(dev) : "";
+        const bool valid =
+                arch == LLM_ARCH_QWEN35 && type == LLM_TYPE_27B &&
+                hparams.n_layer() == 64 && hparams.n_layer_all == 65 && hparams.n_layer_nextn == 1 &&
+                hparams.n_embd == 5120 && hparams.n_head() == 24 && hparams.n_head_kv() == 4 &&
+                hparams.n_embd_head_k() == 256 && hparams.n_embd_head_v() == 256 &&
+                hparams.ssm_d_conv == 4 && hparams.ssm_d_state == 128 && hparams.ssm_n_group == 16 &&
+                hparams.ssm_dt_rank == 48 && hparams.ssm_d_inner == 6144 && layer_pattern &&
+                params.type_k == GGML_TYPE_Q4_0 && params.type_v == GGML_TYPE_Q4_0 &&
+                cparams.n_seq_max == 1 && cparams.flash_attn && cparams.offload_kqv &&
+                dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                dev_desc.find("RTX 5070 Ti") != std::string::npos;
+        if (!valid) {
+            throw std::runtime_error("LLAMA_QWEN35_BLACKWELL_ENGINE requires the frozen Qwen3.8-27B Q4 KV profile on RTX 5070 Ti");
+        }
+        LLAMA_LOG_INFO("%s: Qwen3.8-27B RTX 5070 Ti engine enabled, context type = %d\n",
+                __func__, int(params.ctx_type));
+    }
+
     switch (arch) {
         // Models that need specific instantiation should be handled in the
         // switch statement
@@ -2343,6 +2370,13 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.n_rs_seq,
                             nullptr);
                 } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen && !mtp_on_hybrid_nemotron) {
+                    // The recurrent S state is bandwidth-sensitive during inference, but keeping
+                    // all speculative rollback snapshots in F32 is especially expensive.  Allow
+                    // an opt-in F16 cache; graph builders cast the selected state back to F32
+                    // before the recurrent kernel and ggml_cpy converts new snapshots on store.
+                    const ggml_type recurrent_type_s =
+                        getenv("LLAMA_RS_F16") != nullptr ? GGML_TYPE_F16 : GGML_TYPE_F32;
+
                     // The main difference between hybrid architectures is the
                     // layer filters, so pick the right one here
                     llama_memory_hybrid::layer_filter_cb filter_attn = nullptr;
@@ -2378,7 +2412,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_n_ubatch     */ cparams.n_ubatch,
                             /* attn_n_pad        */ 1,
                             /* recurrent_type_r  */ GGML_TYPE_F32,
-                            /* recurrent_type_s  */ GGML_TYPE_F32,
+                            /* recurrent_type_s  */ recurrent_type_s,
                             /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
@@ -2397,7 +2431,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_n_swa        */ hparams.n_swa,
                             /* attn_swa_type     */ hparams.swa_type,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
-                            /* recurrent_type_v  */ GGML_TYPE_F32,
+                            /* recurrent_type_v  */ recurrent_type_s,
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,

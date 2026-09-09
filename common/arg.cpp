@@ -260,6 +260,28 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         if (buft) {
             buft_list[ggml_backend_buft_name(buft)] = buft;
         }
+        // Advanced placement: expose accelerator-owned pinned host buffers.
+        // This permits selected weights to remain in system RAM while kernels
+        // on a discrete GPU access them through the host mapping.
+        auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
+        if (host_buft) {
+            buft_list[ggml_backend_buft_name(host_buft)] = host_buft;
+        }
+
+        // Extra device buffer types are normally selected by the model loader
+        // automatically.  Expose them here as well so a diagnostic placement
+        // can explicitly select CPU_REPACK (or another registered extra
+        // buffer) with --override-tensor.  This is useful for measuring an
+        // optimized CPU weight layout without changing the tensor's numeric
+        // type or bytes.
+        auto * reg = ggml_backend_dev_backend_reg(dev);
+        auto get_extra_bufts = (ggml_backend_dev_get_extra_bufts_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+        if (get_extra_bufts) {
+            for (auto ** extra = get_extra_bufts(dev); extra && *extra; ++extra) {
+                buft_list[ggml_backend_buft_name(*extra)] = *extra;
+            }
+        }
     }
 
     for (const auto & override : string_split<std::string>(value, ',')) {

@@ -146,17 +146,25 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
+    const bool layer_graph = params.gtype == LLM_GRAPH_TYPE_DECODER_LAYER;
+    const int layer_start = layer_graph ? (int) params.layer_start : 0;
+    const int layer_end   = layer_graph ? (int) params.layer_end   : n_layer;
+
+    GGML_ASSERT(layer_start >= 0 && layer_start < layer_end && layer_end <= n_layer);
+
     inpL = build_inp_embd(model.tok_embd);
 
     cb(inpL, "model.input_embed", -1);
 
     auto * inp = build_inp_mem_hybrid();
 
-    ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_pos = build_inp_pos();
+    // Intermediate layer graphs return every hidden row. Output selection is
+    // meaningful only in the final stage that builds the LM head.
+    ggml_tensor * inp_out_ids = layer_end == n_layer ? build_inp_out_ids() : nullptr;
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = layer_start; il < layer_end; ++il) {
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
@@ -206,6 +214,13 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         inpL = cur;
     }
     cur = inpL;
+
+    if (layer_end < n_layer) {
+        cb(cur, "layer_stage_output", layer_end - 1);
+        res->t_embd = cur;
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
 
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
 
@@ -388,7 +403,12 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    ggml_tensor * ssm_snapshots_all = mctx_cur->get_s_snap_l(il);
+    ggml_tensor * state = mctx_cur->txn_enabled()
+        ? build_rs_txn(inp, ssm_states_all, hparams.n_embd_s(), n_seqs)
+        : ssm_snapshots_all
+            ? build_rs_split(inp, ssm_states_all, ssm_snapshots_all, hparams.n_embd_s(), n_seqs)
+            : build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 

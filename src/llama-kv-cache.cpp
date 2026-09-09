@@ -8,9 +8,11 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
+#include <set>
 #include <stdexcept>
 
 static bool ggml_is_power_of_2(int n) {
@@ -84,6 +86,27 @@ llama_kv_cache::llama_kv_cache(
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl) {
 
+    sparse_vmm_qwen35_blackwell = getenv("LLAMA_QWEN35_BLACKWELL_ENGINE") != nullptr;
+    sparse_vmm_enabled = sparse_vmm_qwen35_blackwell || getenv("LLAMA_KV_SPARSE_VMM") != nullptr;
+    sparse_vmm_status = sparse_vmm_enabled ? sparse_vmm_state::reserved : sparse_vmm_state::disabled;
+
+    auto parse_rows = [](const char * name, uint32_t fallback) {
+        if (const char * value = getenv(name)) {
+            char * end = nullptr;
+            const unsigned long parsed = std::strtoul(value, &end, 10);
+            if (end != value && parsed > 0) {
+                return uint32_t(std::min<unsigned long>(parsed, UINT32_MAX));
+            }
+        }
+        return fallback;
+    };
+
+    sparse_vmm_chunk_rows = parse_rows("LLAMA_KV_SPARSE_CHUNK_TOKENS", 4096);
+    sparse_vmm_prefetch_rows = parse_rows(
+            "LLAMA_KV_SPARSE_PREFETCH_TOKENS", sparse_vmm_qwen35_blackwell ? sparse_vmm_chunk_rows : 0);
+    sparse_vmm_initial_rows = std::min(kv_size, parse_rows(
+            "LLAMA_KV_SPARSE_INITIAL_TOKENS", sparse_vmm_qwen35_blackwell ? 8192 : 0));
+
     // shared cells view the source cache's K/V tensors, so the cell count
     // follows the source allocation: a fitted target can be smaller than the
     // draft default and oversized views would overflow the source tensors
@@ -106,6 +129,7 @@ llama_kv_cache::llama_kv_cache(
         }
     };
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+    std::map<ggml_backend_buffer_type_t, ggml_backend_dev_t, ggml_backend_buft_comparator> dev_map;
 
     // create a context for each buffer type
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
@@ -160,6 +184,21 @@ llama_kv_cache::llama_kv_cache(
 
     const bool is_mla = hparams.is_mla();
 
+    // Experimental split placement for memory-constrained dedicated GPUs.
+    // Keep the first N target-model KV layers in pinned host memory while the
+    // remaining target layers (and the MTP layer) stay on the accelerator.
+    // This is deliberately separate from offload_kqv: attention still runs on
+    // the GPU and accesses these selected cache tensors through CUDA host memory.
+    uint32_t kv_host_n = 0;
+    if (const char * value = getenv("LLAMA_KV_HOST_N")) {
+        char * end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        if (end != value && parsed > 0) {
+            kv_host_n = uint32_t(parsed);
+        }
+    }
+    uint32_t target_kv_ordinal = 0;
+
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
@@ -211,11 +250,34 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
 
-        if (offload) {
+        const bool is_target_kv = il < hparams.n_layer();
+        const bool use_split_host = offload && is_target_kv && target_kv_ordinal < kv_host_n;
+        if (is_target_kv) {
+            ++target_kv_ordinal;
+        }
+
+        if (use_split_host) {
+            auto * dev = model.dev_layer(il);
+            if (auto * host_buft = ggml_backend_dev_host_buffer_type(dev)) {
+                buft = host_buft;
+                dev_name = ggml_backend_buft_name(host_buft);
+            }
+        } else if (offload) {
             auto * dev = model.dev_layer(il);
             buft = ggml_backend_dev_buffer_type(dev);
+            dev_map[buft] = dev;
 
             dev_name = ggml_backend_dev_name(dev);
+        } else if (getenv("LLAMA_KV_HOST_GPU_ATTN") != nullptr) {
+            // Experimental zero-copy KV placement: keep the cache in pinned
+            // host memory while allowing the accelerator to execute attention.
+            // This is opt-in because it trades device-memory pressure for host
+            // bus traffic and is only useful on memory-constrained systems.
+            auto * dev = model.dev_layer(il);
+            if (auto * host_buft = ggml_backend_dev_host_buffer_type(dev)) {
+                buft = host_buft;
+                dev_name = ggml_backend_buft_name(host_buft);
+            }
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
@@ -280,6 +342,19 @@ llama_kv_cache::llama_kv_cache(
                 t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
             }
         } else {
+            if (sparse_vmm_enabled) {
+                const auto it_dev = dev_map.find(buft);
+                if (it_dev != dev_map.end()) {
+                    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(it_dev->second);
+                    using set_next_sparse_fn = bool (*)();
+                    auto * set_next_sparse = (set_next_sparse_fn)
+                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_next_sparse_alloc");
+                    if (set_next_sparse && set_next_sparse()) {
+                        LLAMA_LOG_INFO("%s: requesting sparse CUDA VMM allocation for %s KV buffer\n",
+                                __func__, ggml_backend_buft_name(buft));
+                    }
+                }
+            }
             buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
         }
         if (!buf) {
@@ -290,6 +365,30 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_clear(buf, 0);
         ctxs_bufs.emplace_back(std::move(ctx), buf);
+    }
+
+    if (sparse_vmm_enabled) {
+        const uint32_t initial_rows = sparse_vmm_initial_rows;
+        if (initial_rows > 0) {
+            const uint32_t commit_step = std::min(sparse_vmm_chunk_rows, initial_rows);
+            sparse_vmm_status = sparse_vmm_state::growing;
+            for (uint32_t committed = commit_step;;) {
+                const uint32_t rows = std::min(initial_rows, committed);
+                if (!sparse_vmm_commit(rows)) {
+                    sparse_vmm_status = sparse_vmm_state::failed;
+                    throw std::runtime_error("failed to precommit sparse CUDA KV pages");
+                }
+                if (rows == initial_rows) {
+                    break;
+                }
+                committed = uint32_t(std::min<uint64_t>(initial_rows, uint64_t(committed) + commit_step));
+            }
+            sparse_vmm_resident_rows = initial_rows;
+            sparse_vmm_generation++;
+            sparse_vmm_status = sparse_vmm_state::resident;
+            LLAMA_LOG_INFO("%s: sparse CUDA KV precommitted through %u/%u rows\n",
+                    __func__, initial_rows, kv_size);
+        }
     }
 
     {
@@ -365,6 +464,7 @@ llama_kv_cache::llama_kv_cache(
 }
 
 void llama_kv_cache::clear(bool data) {
+    invalidate_ring_mma_layer_cache();
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
@@ -378,6 +478,7 @@ void llama_kv_cache::clear(bool data) {
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    invalidate_ring_mma_layer_cache();
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return true;
@@ -445,7 +546,14 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     return true;
 }
 
+bool llama_kv_cache::seq_rm_attn(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    // A plain KV cache contains attention state only, so the specialized
+    // operation is identical to the normal range removal.
+    return seq_rm(seq_id, p0, p1);
+}
+
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    invalidate_ring_mma_layer_cache();
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -538,6 +646,7 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 }
 
 void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
+    invalidate_ring_mma_layer_cache();
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -565,6 +674,7 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    invalidate_ring_mma_layer_cache();
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -615,6 +725,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
 }
 
 void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    invalidate_ring_mma_layer_cache();
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -694,6 +805,188 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
     }
 
     return ret;
+}
+
+void llama_kv_cache::invalidate_ring_mma_layer_cache() const {
+    using invalidate_fn = bool (*)(ggml_backend_dev_t);
+
+    // A backend compute context is shared by many KV layers.  One epoch bump
+    // per device is enough to invalidate every pointer-stable layer cache on
+    // that device.  Key by the model compute device rather than the K/V buffer:
+    // split-ring tensors can reside in pinned host memory while their derived
+    // cache belongs to a CUDA compute context.
+    std::set<ggml_backend_dev_t> invalidated;
+    for (const auto & layer : layers) {
+        ggml_backend_dev_t dev = model.dev_layer(layer.il);
+        if (dev == nullptr || invalidated.find(dev) != invalidated.end()) {
+            continue;
+        }
+
+        invalidated.insert(dev);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        auto * invalidate = reg != nullptr ? (invalidate_fn)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_invalidate_ring_mma_layer_cache") : nullptr;
+        if (invalidate != nullptr) {
+            (void) invalidate(dev);
+        }
+    }
+}
+
+bool llama_kv_cache::sparse_vmm_commit(uint32_t rows) const {
+    if (rows == 0 || !sparse_vmm_enabled) {
+        return true;
+    }
+
+    using sparse_commit_fn = bool (*)(ggml_tensor *, size_t);
+    std::map<ggml_backend_reg_t, sparse_commit_fn> commit_fns;
+    uint32_t tensors_committed = 0;
+    bool success = true;
+
+    for (const auto & layer : layers) {
+        auto * dev = model.dev_layer(layer.il);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        auto it = commit_fns.find(reg);
+        if (it == commit_fns.end()) {
+            auto * fn = (sparse_commit_fn)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_sparse_commit_tensor");
+            it = commit_fns.emplace(reg, fn).first;
+        }
+
+        sparse_commit_fn commit = it->second;
+        if (!commit) {
+            continue;
+        }
+        if (layer.k) {
+            if (commit(layer.k, rows)) {
+                ++tensors_committed;
+            } else {
+                success = false;
+            }
+        }
+        if (layer.v) {
+            if (commit(layer.v, rows)) {
+                ++tensors_committed;
+            } else {
+                success = false;
+            }
+        }
+    }
+
+    if (getenv("LLAMA_KV_SPARSE_TRACE") != nullptr) {
+        LLAMA_LOG_INFO("%s: rows = %u, sparse tensors = %u, success = %d\n",
+                __func__, rows, tensors_committed, int(success));
+    }
+    return success;
+}
+
+bool llama_kv_cache::sparse_vmm_trim(uint32_t rows) const {
+    if (!sparse_vmm_enabled) {
+        return true;
+    }
+
+    using sparse_trim_fn = bool (*)(ggml_tensor *, size_t);
+    std::map<ggml_backend_reg_t, sparse_trim_fn> trim_fns;
+    uint32_t tensors_trimmed = 0;
+    bool success = true;
+
+    for (const auto & layer : layers) {
+        auto * dev = model.dev_layer(layer.il);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        auto it = trim_fns.find(reg);
+        if (it == trim_fns.end()) {
+            auto * fn = (sparse_trim_fn)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_sparse_trim_tensor");
+            it = trim_fns.emplace(reg, fn).first;
+        }
+
+        sparse_trim_fn trim = it->second;
+        if (!trim) {
+            continue;
+        }
+        if (layer.k) {
+            success = trim(layer.k, rows) && success;
+            ++tensors_trimmed;
+        }
+        if (layer.v) {
+            success = trim(layer.v, rows) && success;
+            ++tensors_trimmed;
+        }
+    }
+
+    if (getenv("LLAMA_KV_SPARSE_TRIM_TRACE") != nullptr) {
+        LLAMA_LOG_INFO("%s: rows = %u, sparse tensors = %u, success = %d\n",
+                __func__, rows, tensors_trimmed, int(success));
+    }
+    return success;
+}
+
+bool llama_kv_cache::sparse_vmm_prepare(
+        const slot_info_vec_t & sinfos, const std::vector<llama_ubatch> & ubatches) const {
+    if (!sparse_vmm_enabled) {
+        return true;
+    }
+
+    uint32_t max_row = 0;
+    uint32_t max_ubatch = 0;
+    for (const auto & sinfo : sinfos) {
+        for (const auto & idxs : sinfo.idxs) {
+            for (uint32_t idx : idxs) {
+                max_row = std::max(max_row, idx + 1);
+            }
+        }
+    }
+    for (const auto & ubatch : ubatches) {
+        max_ubatch = std::max(max_ubatch, uint32_t(ubatch.n_tokens));
+    }
+
+    const uint32_t prefetch = sparse_vmm_qwen35_blackwell ?
+            std::max(sparse_vmm_prefetch_rows, max_ubatch) : sparse_vmm_prefetch_rows;
+    uint32_t used_max = 0;
+    for (const auto & cells : v_cells) {
+        used_max = std::max(used_max, cells.used_max_p1());
+    }
+    const uint64_t needed = std::min<uint64_t>(
+            get_size(), uint64_t(std::max(max_row, used_max)) + prefetch);
+    const uint64_t rounded = ((needed + sparse_vmm_chunk_rows - 1)/sparse_vmm_chunk_rows)*sparse_vmm_chunk_rows;
+    const uint32_t rows = uint32_t(std::min<uint64_t>(get_size(), rounded));
+
+    std::lock_guard<std::mutex> lock(sparse_vmm_mutex);
+    if (sparse_vmm_status == sparse_vmm_state::failed) {
+        return false;
+    }
+    // Compact/new conversations can make the live cell high-water mark much
+    // smaller than the largest context ever seen. Return only complete cold
+    // mappings, with a two-chunk hysteresis to avoid page-table churn around a
+    // boundary. The virtual tensor and all arithmetic remain unchanged.
+    if (getenv("LLAMA_KV_SPARSE_TRIM") != nullptr &&
+            rows + 2*sparse_vmm_chunk_rows <= sparse_vmm_resident_rows) {
+        sparse_vmm_status = sparse_vmm_state::growing;
+        if (!sparse_vmm_trim(rows)) {
+            sparse_vmm_status = sparse_vmm_state::failed;
+            return false;
+        }
+        sparse_vmm_resident_rows = rows;
+        sparse_vmm_generation++;
+        sparse_vmm_status = sparse_vmm_state::resident;
+    }
+    if (rows <= sparse_vmm_resident_rows) {
+        return true;
+    }
+
+    sparse_vmm_status = sparse_vmm_state::growing;
+    if (!sparse_vmm_commit(rows)) {
+        sparse_vmm_status = sparse_vmm_state::failed;
+        return false;
+    }
+
+    sparse_vmm_resident_rows = rows;
+    sparse_vmm_generation++;
+    sparse_vmm_status = sparse_vmm_state::resident;
+    if (getenv("LLAMA_KV_SPARSE_TRACE") != nullptr) {
+        LLAMA_LOG_INFO("%s: resident rows = %u/%u, requested = %u, prefetch = %u, generation = %llu\n",
+                __func__, rows, get_size(), max_row, prefetch, (unsigned long long) sparse_vmm_generation);
+    }
+    return true;
 }
 
 llama_memory_context_ptr llama_kv_cache::init_batch(
@@ -808,10 +1101,17 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         return {};
     }
 
+    if (!sparse_vmm_prepare(res, ubatches)) {
+        throw std::runtime_error("failed to grow sparse CUDA KV pages");
+    }
+
     return res;
 }
 
 bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
+    if (do_shift || !sc_info.empty()) {
+        invalidate_ring_mma_layer_cache();
+    }
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return true;
@@ -2036,6 +2336,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 }
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    invalidate_ring_mma_layer_cache();
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -2337,6 +2638,26 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo) {
     auto & cells = v_cells[strm];
 
+    // Batch scatter restores into maximal contiguous destination runs. This keeps the
+    // serialized byte order unchanged while avoiding one backend copy per KV cell.
+    struct cell_run {
+        uint32_t from;
+        uint32_t to;
+    };
+    std::vector<cell_run> runs;
+    if (cell_count > 0) {
+        const auto & idxs = sinfo.idxs[0];
+        uint32_t i0 = 0;
+        while (i0 < cell_count) {
+            uint32_t i1 = i0 + 1;
+            while (i1 < cell_count && idxs[i1] == idxs[i1 - 1] + 1) {
+                ++i1;
+            }
+            runs.push_back({ idxs[i0], idxs[i1 - 1] + 1 });
+            i0 = i1;
+        }
+    }
+
     uint32_t v_trans;
     uint32_t n_layer;
 
@@ -2384,17 +2705,8 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             return false;
         }
 
-        if (cell_count) {
-            if (sinfo.is_contiguous()) {
-                // Fast path: contiguous cells, single memcpy
-                io.read_tensor(k, sinfo.head() * k_size_row, cell_count * k_size_row);
-            } else {
-                // Slow path: scatter to non-contiguous positions
-                for (uint32_t i = 0; i < cell_count; ++i) {
-                    const size_t dst_offset = sinfo.idxs[0][i] * k_size_row;
-                    io.read_tensor(k, dst_offset, k_size_row);
-                }
-            }
+        for (const auto & r : runs) {
+            io.read_tensor(k, (size_t) r.from * k_size_row, (size_t) (r.to - r.from) * k_size_row);
         }
     }
 
@@ -2427,17 +2739,8 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
                 return false;
             }
 
-            if (cell_count) {
-                if (sinfo.is_contiguous()) {
-                    // Fast path: contiguous cells, single memcpy
-                    io.read_tensor(v, sinfo.head() * v_size_row, cell_count * v_size_row);
-                } else {
-                    // Slow path: scatter to non-contiguous positions
-                    for (uint32_t i = 0; i < cell_count; ++i) {
-                        const size_t dst_offset = sinfo.idxs[0][i] * v_size_row;
-                        io.read_tensor(v, dst_offset, v_size_row);
-                    }
-                }
+            for (const auto & r : runs) {
+                io.read_tensor(v, (size_t) r.from * v_size_row, (size_t) (r.to - r.from) * v_size_row);
             }
         }
     } else {
@@ -2478,22 +2781,10 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
                 return false;
             }
 
-            if (cell_count) {
-                if (sinfo.is_contiguous()) {
-                    // Fast path: contiguous cells
-                    const uint32_t h = sinfo.head();
-                    for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
-                        const size_t dst_offset = (h + j * cells.size()) * v_size_el;
-                        io.read_tensor(v, dst_offset, cell_count * v_size_el);
-                    }
-                } else {
-                    // Slow path: scatter to non-contiguous positions
-                    for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
-                        for (uint32_t i = 0; i < cell_count; ++i) {
-                            const size_t dst_offset = (sinfo.idxs[0][i] + j * cells.size()) * v_size_el;
-                            io.read_tensor(v, dst_offset, v_size_el);
-                        }
-                    }
+            for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
+                for (const auto & r : runs) {
+                    const size_t dst_offset = ((size_t) r.from + j * cells.size()) * v_size_el;
+                    io.read_tensor(v, dst_offset, (size_t) (r.to - r.from) * v_size_el);
                 }
             }
         }
@@ -2511,6 +2802,21 @@ llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : sta
 llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
     n_kv = kv->get_size();
+
+    // The full-cache context is used only to size the scheduler's initial
+    // compute arena.  On an elastic sparse-VMM cache, reserving conversion and
+    // attention scratch for the entire logical context up front defeats the
+    // purpose of keeping the cold KV pages in host memory.  Allow the initial
+    // reservation to model a smaller resident working set; the scheduler
+    // already grows its arena automatically when a later real graph needs more.
+    // This does not change the logical KV size or any runtime attention view.
+    if (const char * value = std::getenv("LLAMA_KV_RESERVE_TOKENS")) {
+        char * end = nullptr;
+        const unsigned long parsed = std::strtoul(value, &end, 10);
+        if (end != value && *end == '\0' && parsed > 0) {
+            n_kv = std::min<uint32_t>(n_kv, uint32_t(std::min<unsigned long>(parsed, UINT32_MAX)));
+        }
+    }
 
     const uint32_t n_stream = kv->get_n_stream();
 
@@ -2538,7 +2844,12 @@ llama_kv_cache_context::llama_kv_cache_context(
 llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv,
         llama_kv_cache::slot_info_vec_t sinfos,
-        std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), sinfos(std::move(sinfos)), ubatches(std::move(ubatches)) {
+        std::vector<llama_ubatch> ubatches) :
+    status(LLAMA_MEMORY_STATUS_SUCCESS),
+    kv(kv),
+    sinfos(std::move(sinfos)),
+    ubatches(std::move(ubatches)),
+    n_kv_per_ubatch(this->ubatches.size(), -1) {
 }
 
 llama_kv_cache_context::~llama_kv_cache_context() = default;
@@ -2565,6 +2876,7 @@ bool llama_kv_cache_context::apply() {
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);
+    n_kv_per_ubatch[i_cur] = n_kv;
 
     return true;
 }
@@ -2581,6 +2893,16 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+bool llama_kv_cache_context::select_ubatch(size_t index) {
+    if (index >= ubatches.size() || n_kv_per_ubatch[index] < 0) {
+        return false;
+    }
+
+    i_cur = index;
+    n_kv  = n_kv_per_ubatch[index];
+    return true;
 }
 
 ggml_type llama_kv_cache_context::type_k() const {

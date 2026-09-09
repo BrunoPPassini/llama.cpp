@@ -10,6 +10,15 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * Q = dst->src[0];
 
+    const char * fixed_mtp_shape_env = getenv("LLAMA_MTP_MMA_FIXED_SHAPE");
+    if constexpr (ncols2 == 8) {
+        if (fixed_mtp_shape_env != nullptr && strcmp(fixed_mtp_shape_env, "0") != 0 &&
+                cc >= GGML_CUDA_CC_BLACKWELL && Q->ne[1] <= 5) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 1, ncols2>(ctx, dst);
+            return;
+        }
+    }
+
     if constexpr (ncols2 <= 8) {
         if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2) {
             ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8/ncols2, ncols2>(ctx, dst);
@@ -457,6 +466,27 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
+    const char * fixed_mtp_shape_env = getenv("LLAMA_MTP_MMA_FIXED_SHAPE");
+    if (fixed_mtp_shape_env != nullptr && strcmp(fixed_mtp_shape_env, "0") != 0 &&
+            cc >= GGML_CUDA_CC_BLACKWELL && Q->ne[1] <= 5 &&
+            gqa_opt_applies && gqa_ratio > 4 &&
+            ggml_is_quantized(K->type) && ggml_is_quantized(V->type)) {
+        return BEST_FATTN_KERNEL_MMA_F16;
+    }
+
+    // Experimental exact host-ring attention.  The persistent softmax state is
+    // currently implemented by the vector kernel.  Speculative verification
+    // batches are small (up to 8 Q rows), so route only those calls through the
+    // vector kernel when explicitly requested; prompt prefill keeps the normal
+    // tensor-core/tile selection.  This must precede the NVIDIA tensor-core
+    // dispatch below, which otherwise returns MMA immediately for Q > 2.
+    const char * ring_force_vec_env = getenv("LLAMA_KV_HOST_RING_FORCE_VEC");
+    if (ring_force_vec_env != nullptr && strcmp(ring_force_vec_env, "0") != 0 &&
+            can_use_vector_kernel && Q->ne[1] <= 8 &&
+            ggml_is_quantized(K->type) && ggml_is_quantized(V->type)) {
+        return BEST_FATTN_KERNEL_VEC;
+    }
+
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel) {
@@ -561,6 +591,32 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             break;
     }
 
+    // The experimental stateful MMA ring dequantizes one fixed KV tile at a
+    // time. Do not reserve the legacy context-sized F16 materialization when
+    // the tensor layout can take that path; launch_fattn applies the identical
+    // predicate before using the fixed buffers.
+    const char * ring_mma_env = getenv("LLAMA_KV_HOST_RING_MMA");
+    const char * ring_mma_cold_only_env = getenv("LLAMA_KV_HOST_RING_MMA_COLD_ONLY");
+    const char * hot_prefix_env = getenv("LLAMA_KV_SPARSE_DEVICE_PREFIX_TOKENS");
+    const int64_t hot_prefix = hot_prefix_env ? strtoll(hot_prefix_env, nullptr, 10) : 0;
+    const bool ring_mma_cold_only = ring_mma_cold_only_env != nullptr &&
+            strcmp(ring_mma_cold_only_env, "0") != 0;
+    const bool ring_mma_has_cold_tail = hot_prefix > 0 && hot_prefix < K->ne[1] && hot_prefix < V->ne[1];
+    if (kernel == BEST_FATTN_KERNEL_MMA_F16 &&
+            ring_mma_env != nullptr && strcmp(ring_mma_env, "0") != 0 &&
+            (!ring_mma_cold_only || ring_mma_has_cold_tail) &&
+            ggml_is_quantized(K->type) && ggml_is_quantized(V->type) &&
+            K->ne[3] == 1 && V->ne[3] == 1 && K->ne[1] == V->ne[1]) {
+        const size_t K_row_bytes = ggml_row_size(K->type, K->ne[0]);
+        const size_t V_row_bytes = ggml_row_size(V->type, V->ne[0]);
+        const bool K_token_major = K->nb[2] == K_row_bytes && K->nb[1] == K_row_bytes*size_t(K->ne[2]);
+        const bool V_token_major = V->nb[2] == V_row_bytes && V->nb[1] == V_row_bytes*size_t(V->ne[2]);
+        if (K_token_major && V_token_major) {
+            need_f16_K = false;
+            need_f16_V = false;
+        }
+    }
+
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
         ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
 
@@ -569,7 +625,33 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    const best_fattn_kernel best_kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+    const char * ring_trace_env = getenv("LLAMA_KV_HOST_RING_TRACE");
+    static int ring_trace_count = 0;
+    if (ring_trace_env != nullptr && strcmp(ring_trace_env, "0") != 0 && ring_trace_count < 64) {
+        const ggml_tensor * Q = dst->src[0];
+        const ggml_tensor * K = dst->src[1];
+        const ggml_tensor * V = dst->src[2];
+        if (Q->ne[1] <= 8) {
+            ++ring_trace_count;
+            fprintf(stderr,
+                "KV_RING_DISPATCH kernel=%d Q=[%lld,%lld,%lld,%lld] "
+                "K=[%lld,%lld,%lld,%lld] V=[%lld,%lld,%lld,%lld] "
+                "types=%s/%s nb1=%zu/%zu row=%zu/%zu prefix=%s ring=%s force_vec=%s ring_mma=%s\n",
+                int(best_kernel),
+                (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3],
+                (long long) K->ne[0], (long long) K->ne[1], (long long) K->ne[2], (long long) K->ne[3],
+                (long long) V->ne[0], (long long) V->ne[1], (long long) V->ne[2], (long long) V->ne[3],
+                ggml_type_name(K->type), ggml_type_name(V->type),
+                K->nb[1], V->nb[1],
+                ggml_row_size(K->type, K->ne[0]), ggml_row_size(V->type, V->ne[0]),
+                getenv("LLAMA_KV_SPARSE_DEVICE_PREFIX_TOKENS") ? getenv("LLAMA_KV_SPARSE_DEVICE_PREFIX_TOKENS") : "<null>",
+                getenv("LLAMA_KV_HOST_RING_FA") ? getenv("LLAMA_KV_HOST_RING_FA") : "<null>",
+                getenv("LLAMA_KV_HOST_RING_FORCE_VEC") ? getenv("LLAMA_KV_HOST_RING_FORCE_VEC") : "<null>",
+                getenv("LLAMA_KV_HOST_RING_MMA") ? getenv("LLAMA_KV_HOST_RING_MMA") : "<null>");
+        }
+    }
+    switch (best_kernel) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:

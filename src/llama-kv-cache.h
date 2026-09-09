@@ -7,6 +7,7 @@
 
 #include <unordered_map>
 #include <vector>
+#include <mutex>
 
 struct llama_cparams;
 struct llama_hparams;
@@ -130,10 +131,12 @@ public:
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+    bool get_can_rm_attn() const override { return true; }
 
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+    bool seq_rm_attn(llama_seq_id seq_id,                           llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
@@ -289,6 +292,30 @@ private:
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 
+    enum class sparse_vmm_state : uint8_t {
+        disabled,
+        reserved,
+        growing,
+        resident,
+        failed,
+    };
+
+    void invalidate_ring_mma_layer_cache() const;
+
+    bool sparse_vmm_commit(uint32_t rows) const;
+    bool sparse_vmm_trim(uint32_t rows) const;
+    bool sparse_vmm_prepare(const slot_info_vec_t & sinfos, const std::vector<llama_ubatch> & ubatches) const;
+
+    bool sparse_vmm_enabled = false;
+    bool sparse_vmm_qwen35_blackwell = false;
+    uint32_t sparse_vmm_initial_rows = 0;
+    uint32_t sparse_vmm_chunk_rows = 4096;
+    uint32_t sparse_vmm_prefetch_rows = 0;
+    mutable std::mutex sparse_vmm_mutex;
+    mutable sparse_vmm_state sparse_vmm_status = sparse_vmm_state::disabled;
+    mutable uint32_t sparse_vmm_resident_rows = 0;
+    mutable uint64_t sparse_vmm_generation = 0;
+
     size_t total_size() const;
 
     size_t size_k_bytes() const;
@@ -366,6 +393,10 @@ public:
 
     uint32_t get_n_kv() const;
 
+    // Re-select an already prepared microbatch without applying its KV writes
+    // again. Used by the experimental layer-major prefill scheduler.
+    bool select_ubatch(size_t index);
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 
@@ -425,6 +456,10 @@ private:
     slot_info_vec_t sinfos;
 
     std::vector<llama_ubatch> ubatches;
+
+    // n_kv is a per-microbatch graph property. Preserve it when a prepared
+    // microbatch is revisited by a later decoder-layer stage.
+    std::vector<int32_t> n_kv_per_ubatch;
 
     //
     // data needed for building the compute graph for the current ubatch:

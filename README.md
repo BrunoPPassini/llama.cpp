@@ -17,6 +17,18 @@
 
 </div>
 
+## Qwen3.8 Blackwell 256K runtime branch
+
+This branch contains the complete derived source for the experimental Qwen3.8-27B
+runtime developed on an RTX 5070 Ti. It is based on upstream commit
+`d775b8967a46d8beb110d444aa3b8938179e0dd8` and includes the CUDA, allocator,
+hybrid-KV, recurrent-state, MTP, and server changes needed by the published
+runtime profile.
+
+- Read the [engineering study](docs/LOCAL-QWEN-BLACKWELL-STUDY.md).
+- Use the [reproducible Windows launcher](examples/qwen38-blackwell/README.md).
+- Model weights and generated binaries are intentionally not committed.
+
 ## Quick start
 
 A few options to get `llama.cpp` installed on your machine:

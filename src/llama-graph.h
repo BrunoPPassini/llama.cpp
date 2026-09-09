@@ -38,6 +38,9 @@ enum llm_graph_type {
     LLM_GRAPH_TYPE_ENCODER,
     LLM_GRAPH_TYPE_DECODER,
     LLM_GRAPH_TYPE_DECODER_MTP,
+    // Experimental Qwen3.5/3.8 prefill path. The graph evaluates only the
+    // half-open decoder-layer range [layer_start, layer_end).
+    LLM_GRAPH_TYPE_DECODER_LAYER,
 };
 
 enum llm_fused_op {
@@ -274,11 +277,28 @@ public:
     ggml_tensor * s_copy_main;   // I32 [n_seqs]
     ggml_tensor * s_copy_extra;  // I32 [n_rs - n_seqs]
 
+    // Inputs used when the active recurrent S state is F32 and rollback
+    // snapshots live in a separate F16 tensor.
+    ggml_tensor * s_copy_base          = nullptr; // I32 [n_rs]
+    ggml_tensor * s_copy_base_main     = nullptr; // I32 [n_seqs]
+    ggml_tensor * s_copy_base_extra    = nullptr; // I32 [n_rs - n_seqs]
+    ggml_tensor * s_copy_snapshot      = nullptr; // I32 [n_rs]
+    ggml_tensor * s_copy_snapshot_main = nullptr; // I32 [n_seqs]
+    ggml_tensor * s_use_snapshot       = nullptr; // F32 [n_rs]
+    ggml_tensor * s_use_snapshot_main  = nullptr; // F32 [1, n_seqs]
+
+    ggml_tensor * s_copy_txn       = nullptr; // I32 [n_rs]
+    ggml_tensor * s_copy_txn_main  = nullptr;
+    ggml_tensor * s_copy_txn_extra = nullptr;
+    ggml_tensor * s_work_txn       = nullptr; // I64 [n_seqs]
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+    bool txn_batch = false;
+    uint32_t txn_lazy_replay = 0;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
@@ -778,6 +798,11 @@ struct llm_graph_params {
 
     llm_graph_type gtype;
 
+    // Used only by LLM_GRAPH_TYPE_DECODER_LAYER. Keeping the range in the
+    // graph parameters makes graph-reuse checks explicit and safe.
+    uint32_t layer_start = 0;
+    uint32_t layer_end   = 0;
+
     ggml_backend_sched_t sched;
     ggml_backend_t backend_cpu;
 
@@ -867,6 +892,10 @@ struct llm_graph_params {
 
         // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
         if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
+            return false;
+        }
+
+        if (layer_start != other.layer_start || layer_end != other.layer_end) {
             return false;
         }
 
@@ -1325,6 +1354,19 @@ struct llm_graph_context {
                 int32_t   state_size,
                 int32_t   n_seqs,
             const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
+
+    ggml_tensor * build_rs_split(
+            llm_graph_input_rs * inp,
+            ggml_tensor * s_active,
+            ggml_tensor * s_snapshots,
+                int32_t   state_size,
+                int32_t   n_seqs) const;
+
+    ggml_tensor * build_rs_txn(
+            llm_graph_input_rs * inp,
+            ggml_tensor * s,
+                int32_t state_size,
+                int32_t n_seqs) const;
 
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,

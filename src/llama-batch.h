@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama.h"
+#include "ggml-backend.h"
 
 #include "llama-cparams.h"
 
@@ -66,6 +67,13 @@ struct llama_ubatch {
 
     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
     std::shared_ptr<data_t> data;
+
+    // Experimental internal path for layer-major prefill.  Keep these at the
+    // end so existing aggregate initializers remain source-compatible.  When
+    // set, the embedding input is copied directly from this backend tensor
+    // instead of making a device -> host -> device round trip through embd.
+    ggml_tensor   * embd_device         = nullptr;
+    ggml_backend_t embd_device_backend = nullptr;
 };
 
 // a helper for sanitizing, fulfilling and splitting a batch

@@ -20,6 +20,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 #ifdef __APPLE__
@@ -761,8 +764,15 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #define GGML_SCHED_MAX_COPIES 4
 #endif
 
+#ifndef GGML_SCHED_MAX_STAGING_SLOTS
+#define GGML_SCHED_MAX_STAGING_SLOTS 4
+#endif
+
 struct ggml_backend_sched_split {
     int backend_id;
+    int copy_id;
+    int staging_id;
+    size_t staging_used;
     int i_start;
     int i_end;
     struct ggml_tensor ** inputs;
@@ -770,6 +780,141 @@ struct ggml_backend_sched_split {
     int inputs_capacity;
     // graph view of this split
     struct ggml_cgraph graph;
+};
+
+struct ggml_backend_sched_weight_cache_entry {
+    const struct ggml_tensor * src;
+    size_t offset;
+    bool valid;
+};
+
+struct ggml_backend_sched_gate_ram_mirror_entry {
+    struct ggml_tensor * src;
+    void * data;
+    size_t size;
+};
+
+struct ggml_backend_sched_gate_wc_mirror_entry {
+    const struct ggml_tensor * src;
+    int64_t n_rows;
+    ggml_backend_buffer_t buffer;
+    struct ggml_tensor alias;
+};
+
+// Persistent metadata for the cooperative CPU/GPU FFN-gate path.  The tensor
+// payloads live in scheduler-owned reusable buffers; keeping the ggml context
+// and graphs alive avoids rebuilding the same two one-node graphs for every
+// layer and every generated token.
+struct ggml_backend_sched_gate_row_split_plan {
+    struct ggml_context * ctx;
+    struct ggml_tensor * weight_cpu;
+    struct ggml_tensor * input_cpu;
+    struct ggml_tensor * output_cpu;
+    struct ggml_tensor * weight_gpu[2];
+    struct ggml_tensor * input_gpu;
+    struct ggml_tensor * output_gpu[2];
+    struct ggml_cgraph * graph_cpu;
+    struct ggml_cgraph * graph_gpu[2];
+    int64_t n_in;
+    int64_t n_out;
+    int64_t n_batch;
+    int64_t n_gpu;
+};
+
+struct ggml_backend_sched_gate_row_split_pending {
+    bool active;
+    struct ggml_backend_sched_gate_row_split_plan * plan;
+    struct ggml_tensor * output;
+    ggml_backend_t gpu_backend;
+    enum ggml_status gpu_status;
+    int gpu_percent;
+    int64_t n_gpu;
+    int64_t n_cpu;
+    int64_t n_batch;
+    size_t gpu_output_bytes;
+    int64_t begin_us;
+    int slot;
+};
+
+struct ggml_backend_sched_gate_row_split_prefetch {
+    const struct ggml_tensor * weight;
+    int64_t n_gpu;
+    int slot;
+};
+
+// A CPU backend compute call is synchronous.  Keep one persistent worker per
+// scheduler so a host FFN gate can run while the CUDA backend computes the
+// independent FFN-up branch.  The scheduler still joins the worker before the
+// first node which consumes the gate, so this only changes scheduling, not the
+// graph or its numerical operations.
+struct ggml_backend_sched_cpu_gpu_overlap {
+    std::mutex mutex;
+    std::condition_variable task_cv;
+    std::condition_variable done_cv;
+    bool stop = false;
+    bool task_ready = false;
+    bool task_done = true;
+    ggml_backend_t backend = nullptr;
+    struct ggml_cgraph graph = {};
+    enum ggml_status status = GGML_STATUS_SUCCESS;
+    std::thread worker;
+
+    ggml_backend_sched_cpu_gpu_overlap() : worker([this]() {
+        for (;;) {
+            ggml_backend_t task_backend = nullptr;
+            struct ggml_cgraph task_graph = {};
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                task_cv.wait(lock, [this]() { return stop || task_ready; });
+                if (stop && !task_ready) {
+                    return;
+                }
+                task_backend = backend;
+                task_graph = graph;
+                task_ready = false;
+            }
+
+            const enum ggml_status task_status =
+                    ggml_backend_graph_compute_async(task_backend, &task_graph);
+
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                status = task_status;
+                task_done = true;
+            }
+            done_cv.notify_one();
+        }
+    }) {}
+
+    ~ggml_backend_sched_cpu_gpu_overlap() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stop = true;
+        }
+        task_cv.notify_one();
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+
+    void submit(ggml_backend_t task_backend, const struct ggml_cgraph & task_graph) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            GGML_ASSERT(task_done && !task_ready);
+            backend = task_backend;
+            graph = task_graph;
+            status = GGML_STATUS_SUCCESS;
+            task_done = false;
+            task_ready = true;
+        }
+        task_cv.notify_one();
+    }
+
+    enum ggml_status wait() {
+        std::unique_lock<std::mutex> lock(mutex);
+        done_cv.wait(lock, [this]() { return task_done; });
+        return status;
+    }
 };
 
 struct ggml_backend_sched {
@@ -803,9 +948,54 @@ struct ggml_backend_sched {
 
     // pipeline parallelism support
     int n_copies;
+    bool staging_double_buffer;
+    int staging_slots;
     int cur_copy;
     int next_copy;
     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
+    ggml_backend_event_t staging_events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_STAGING_SLOTS];
+    bool staging_event_recorded[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_STAGING_SLOTS];
+    struct ggml_tensor * staging_roots[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_STAGING_SLOTS];
+    ggml_backend_buffer_t staging_buffers[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_STAGING_SLOTS];
+    struct ggml_tensor * weight_cache_roots[GGML_SCHED_MAX_BACKENDS];
+    ggml_backend_buffer_t weight_cache_buffers[GGML_SCHED_MAX_BACKENDS];
+    struct ggml_backend_sched_weight_cache_entry * weight_cache_entries;
+    int weight_cache_n;
+    int weight_cache_capacity;
+    size_t weight_cache_used;
+    bool weight_cache_prefill;
+    bool weight_cache_phase_set;
+    bool weight_cache_owner;
+    struct ggml_backend_sched_gate_ram_mirror_entry * gate_ram_mirrors;
+    int gate_ram_mirror_n;
+    int gate_ram_mirror_capacity;
+    struct ggml_backend_sched_gate_wc_mirror_entry * gate_wc_mirrors;
+    int gate_wc_mirror_n;
+    int gate_wc_mirror_capacity;
+    ggml_backend_buffer_t gate_split_gpu_weight_buffer[2];
+    ggml_backend_buffer_t gate_split_gpu_output_buffer;
+    ggml_backend_buffer_t gate_split_cpu_output_buffer;
+    size_t gate_split_gpu_weight_capacity[2];
+    size_t gate_split_gpu_output_capacity;
+    size_t gate_split_cpu_output_capacity;
+    void * gate_split_gpu_output_host;
+    size_t gate_split_gpu_output_host_capacity;
+    struct ggml_backend_sched_gate_row_split_plan * gate_split_plans[32];
+    struct ggml_backend_sched_cpu_gpu_overlap * cpu_gpu_overlap;
+    // Optional phase-local cache which aliases output.weight's existing GPU
+    // allocation. During prompt chunks which do not compute logits, the output
+    // matrix is dead storage and can hold host-resident FFN gates. The original
+    // bytes are restored before a graph which consumes output.weight and remain
+    // resident for decode. This avoids allocating a second ~1 GiB cache.
+    struct ggml_tensor * weight_cache_alias_output;
+    void * weight_cache_alias_shadow;
+    size_t weight_cache_alias_size;
+    bool weight_cache_alias_dirty;
+    bool weight_cache_alias_can_fill;
+    // Speculative verification may build multi-token graphs during decode.
+    // Once the first real prompt has populated and restored the alias, do not
+    // mistake those graphs for another prompt and overwrite output.weight.
+    bool weight_cache_alias_completed;
     struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
     int graph_inputs_capacity;
@@ -833,6 +1023,207 @@ struct ggml_backend_sched {
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
 #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
 #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
+
+static bool ggml_backend_sched_staging_double_buffer_enabled(void) {
+    const char * value = getenv("LLAMA_STAGING_DOUBLE_BUFFER");
+    return value != NULL && value[0] != '\0' && atoi(value) != 0;
+}
+
+static size_t ggml_backend_sched_staging_buffer_size(void) {
+    size_t size = 64ull*1024*1024;
+    if (const char * value = getenv("LLAMA_STAGING_BUFFER_MIB")) {
+        char * end = NULL;
+        const unsigned long requested = strtoul(value, &end, 10);
+        if (end != value && *end == '\0' && requested > 0) {
+            size = (size_t) requested*1024*1024;
+        }
+    }
+    return size;
+}
+
+static bool ggml_backend_sched_staging_device_reuse_wait_enabled(void) {
+    const char * value = getenv("LLAMA_STAGING_DEVICE_REUSE_WAIT");
+    return value != NULL && value[0] != '\0' && atoi(value) != 0;
+}
+
+static size_t ggml_backend_sched_weight_cache_size(void) {
+    const char * value = getenv("LLAMA_WEIGHT_CACHE_MIB");
+    if (value == NULL || value[0] == '\0') {
+        return 0;
+    }
+    char * end = NULL;
+    const unsigned long requested = strtoul(value, &end, 10);
+    if (end == value || *end != '\0' || requested == 0) {
+        return 0;
+    }
+    return (size_t) requested*1024*1024;
+}
+
+static bool ggml_backend_sched_weight_cache_alias_output_enabled(void) {
+    const char * value = getenv("LLAMA_WEIGHT_CACHE_ALIAS_OUTPUT");
+    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static bool ggml_backend_sched_weight_cache_decode_gates_enabled(void) {
+    const char * value = getenv("LLAMA_WEIGHT_CACHE_DECODE_GATES");
+    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static bool ggml_backend_sched_weight_cache_decode_gate_fits(
+        const struct ggml_tensor * tensor) {
+    if (tensor == NULL) {
+        return false;
+    }
+    int block = -1;
+    if (sscanf(tensor->name, "blk.%d.ffn_gate.weight", &block) != 1 || block < 0) {
+        return false;
+    }
+    const size_t alignment = 256;
+    const size_t bytes = (ggml_nbytes(tensor) + alignment - 1) & ~(alignment - 1);
+    return bytes > 0 && ((size_t) block + 1)*bytes <= ggml_backend_sched_weight_cache_size();
+}
+
+static int ggml_backend_sched_weight_cache_alias_min_block(void) {
+    const char * value = getenv("LLAMA_WEIGHT_CACHE_ALIAS_MIN_BLOCK");
+    if (value == NULL || value[0] == '\0') {
+        return 0;
+    }
+    return std::max(0, atoi(value));
+}
+
+static struct ggml_tensor * ggml_backend_sched_weight_cache_root(
+        ggml_backend_sched_t sched, int backend_id) {
+    struct ggml_tensor * & root = sched->weight_cache_roots[backend_id];
+    if (root == NULL) {
+        root = ggml_new_tensor_1d(sched->ctx, GGML_TYPE_I8,
+                (int64_t) ggml_backend_sched_weight_cache_size());
+        ggml_format_name(root, "weight_cache_root_%d", backend_id);
+        ggml_set_input(root);
+        ggml_set_output(root);
+        tensor_backend_id(root) = backend_id;
+
+        ggml_backend_buffer_t & buffer = sched->weight_cache_buffers[backend_id];
+        if (buffer == NULL) {
+            const size_t alloc_size = ggml_backend_buft_get_alloc_size(sched->bufts[backend_id], root);
+            buffer = ggml_backend_buft_alloc_buffer(sched->bufts[backend_id], alloc_size);
+            GGML_ASSERT(buffer != NULL);
+            ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+        }
+        GGML_ASSERT(ggml_backend_tensor_alloc(buffer, root,
+                ggml_backend_buffer_get_base(buffer)) == GGML_STATUS_SUCCESS);
+    }
+    return root;
+}
+
+static bool ggml_backend_sched_weight_cache_name_eligible(
+        ggml_backend_sched_t sched, const struct ggml_tensor * tensor) {
+    if (!sched->weight_cache_owner || ggml_backend_sched_weight_cache_size() == 0 || tensor == NULL) {
+        return false;
+    }
+    if (ggml_backend_sched_weight_cache_alias_output_enabled()) {
+        int block = -1;
+        const bool is_gate = sscanf(tensor->name, "blk.%d.ffn_gate.weight", &block) == 1;
+        return sched->weight_cache_alias_can_fill &&
+               is_gate &&
+               block >= ggml_backend_sched_weight_cache_alias_min_block();
+    }
+    const bool is_gate = strstr(tensor->name, ".ffn_gate.weight") != NULL &&
+                         strncmp(tensor->name, "blk.", 4) == 0;
+    if (ggml_backend_sched_weight_cache_decode_gates_enabled()) {
+        // Keep prompt evaluation on the proven staging pipeline.  During
+        // decode, persist as many early host gates as fit and reuse them
+        // across token graphs instead of copying them every cycle.
+        const bool eligible = !sched->weight_cache_prefill &&
+                              (is_gate || strcmp(tensor->name, "output.weight") == 0);
+        if (is_gate && getenv("LLAMA_WEIGHT_CACHE_TRACE") != NULL) {
+            fprintf(stderr, "WEIGHT_CACHE_CHECK: %s owner=%d prefill=%d eligible=%d\n",
+                    tensor->name, (int) sched->weight_cache_owner,
+                    (int) sched->weight_cache_prefill, (int) eligible);
+            fflush(stderr);
+        }
+        return eligible;
+    }
+    if (sched->weight_cache_prefill) {
+        return is_gate ||
+               strcmp(tensor->name, "output.weight") == 0;
+    }
+    return strcmp(tensor->name, "output.weight") == 0;
+}
+
+static struct ggml_backend_sched_weight_cache_entry * ggml_backend_sched_weight_cache_find(
+        ggml_backend_sched_t sched, const struct ggml_tensor * src) {
+    for (int i = 0; i < sched->weight_cache_n; ++i) {
+        if (sched->weight_cache_entries[i].src == src) {
+            return &sched->weight_cache_entries[i];
+        }
+    }
+    return NULL;
+}
+
+static struct ggml_backend_sched_weight_cache_entry * ggml_backend_sched_weight_cache_get_or_add(
+        ggml_backend_sched_t sched, const struct ggml_tensor * src) {
+    struct ggml_backend_sched_weight_cache_entry * entry =
+            ggml_backend_sched_weight_cache_find(sched, src);
+    if (entry != NULL) {
+        return entry;
+    }
+    const size_t alignment = 256;
+    const size_t offset = (sched->weight_cache_used + alignment - 1) & ~(alignment - 1);
+    size_t capacity = ggml_backend_sched_weight_cache_size();
+    if (ggml_backend_sched_weight_cache_alias_output_enabled() && sched->weight_cache_alias_output != NULL) {
+        capacity = std::min(capacity, ggml_nbytes(sched->weight_cache_alias_output));
+    }
+    // During prefill, output.weight is consumed only after all backbone gates.
+    // Let it overlap the entire dedicated cache at offset zero.  The execution
+    // path invalidates gate entries before filling output, and invalidates the
+    // output entry when a later prompt graph refills a gate.  This turns one
+    // physical ~1 GiB allocation into a phase-local FFN/output cache without
+    // changing either tensor's bytes.
+    if (sched->weight_cache_prefill && strcmp(src->name, "output.weight") == 0) {
+        if (sched->weight_cache_n >= sched->weight_cache_capacity || ggml_nbytes(src) > capacity) {
+            return NULL;
+        }
+        entry = &sched->weight_cache_entries[sched->weight_cache_n++];
+        entry->src = src;
+        entry->offset = 0;
+        entry->valid = false;
+        return entry;
+    }
+    if (sched->weight_cache_n >= sched->weight_cache_capacity ||
+        offset + ggml_nbytes(src) > capacity) {
+        return NULL;
+    }
+    entry = &sched->weight_cache_entries[sched->weight_cache_n++];
+    entry->src = src;
+    entry->offset = offset;
+    entry->valid = false;
+    sched->weight_cache_used = offset + ggml_nbytes(src);
+    return entry;
+}
+
+static struct ggml_tensor * ggml_backend_sched_staging_root(
+        ggml_backend_sched_t sched, int backend_id, int copy_id) {
+    GGML_ASSERT(copy_id >= 0 && copy_id < sched->staging_slots);
+    struct ggml_tensor * & root = sched->staging_roots[backend_id][copy_id];
+    if (root == NULL) {
+        root = ggml_new_tensor_1d(sched->ctx, GGML_TYPE_I8,
+                (int64_t) ggml_backend_sched_staging_buffer_size());
+        ggml_format_name(root, "staging_root_%d_%d", backend_id, copy_id);
+        ggml_set_input(root);
+        ggml_set_output(root); // keep both ping-pong buffers alive for the full graph
+        tensor_backend_id(root) = backend_id;
+
+        ggml_backend_buffer_t & buffer = sched->staging_buffers[backend_id][copy_id];
+        if (buffer == NULL) {
+            const size_t alloc_size = ggml_backend_buft_get_alloc_size(sched->bufts[backend_id], root);
+            buffer = ggml_backend_buft_alloc_buffer(sched->bufts[backend_id], alloc_size);
+            GGML_ASSERT(buffer != NULL);
+            ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+        }
+        GGML_ASSERT(ggml_backend_tensor_alloc(buffer, root, ggml_backend_buffer_get_base(buffer)) == GGML_STATUS_SUCCESS);
+    }
+    return root;
+}
 
 static void ggml_backend_sched_split_inputs_grow(struct ggml_backend_sched_split * split) {
     int new_cap = GGML_SCHED_MAX_SPLIT_INPUTS;
@@ -874,14 +1265,147 @@ static int ggml_backend_sched_backend_id(ggml_backend_sched_t sched, ggml_backen
     return -1;
 }
 
+// A CUDA_Host weight can either be consumed directly by CUDA over PCIe or be
+// copied into a temporary CUDA buffer.  Direct access is useful for the tiny
+// decode batches because it avoids making a new copy for every token, while a
+// contiguous copy is substantially faster for large prompt batches.  Keep the
+// policy in the scheduler so the same mapped allocation can use both paths.
+//
+// LLAMA_CUDA_HOST_DIRECT_MAX_BATCH=N means:
+//   batch <= N: CUDA consumes CUDA_Host weights directly;
+//   batch >  N: treat the weight as CPU-resident, allowing op_offload to make
+//               the normal temporary CUDA copy.
+static int64_t ggml_backend_sched_cuda_host_direct_max_batch(void) {
+    const char * value = getenv("LLAMA_CUDA_HOST_DIRECT_MAX_BATCH");
+    if (value == NULL || value[0] == '\0') {
+        return -1;
+    }
+    return strtoll(value, NULL, 10);
+}
+
+// Optional inverse threshold used by memory-constrained prefill profiles.
+// A large prompt batch can consume a mapped CUDA_Host weight directly while
+// tiny decode batches keep using a temporary device copy.  This avoids
+// reserving the large prefill staging graph without forcing latency-sensitive
+// decode to read weights over PCIe.
+static int64_t ggml_backend_sched_cuda_host_direct_min_batch(void) {
+    const char * value = getenv("LLAMA_CUDA_HOST_DIRECT_MIN_BATCH");
+    if (value == NULL || value[0] == '\0') {
+        return -1;
+    }
+    return strtoll(value, NULL, 10);
+}
+
+// Small mapped weights are cheap enough to read directly over PCIe and, more
+// importantly for close-fit profiles, do not justify a persistent device-side
+// copy.  Large FFN weights still follow the batch policy above.
+static size_t ggml_backend_sched_cuda_host_direct_max_bytes(void) {
+    const char * value = getenv("LLAMA_CUDA_HOST_DIRECT_MAX_MIB");
+    if (value == NULL || value[0] == '\0') {
+        return 0;
+    }
+    char * end = NULL;
+    const unsigned long requested = strtoul(value, &end, 10);
+    if (end == value || *end != '\0' || requested == 0) {
+        return 0;
+    }
+    return (size_t) requested*1024*1024;
+}
+
+static int64_t ggml_backend_sched_op_batch_size(const struct ggml_tensor * op) {
+    if (op == NULL) {
+        return 0;
+    }
+    switch (op->op) {
+        case GGML_OP_GET_ROWS:
+            return 0;
+        case GGML_OP_MUL_MAT:
+            return op->ne[1];
+        case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_ROPE:
+        case GGML_OP_ROPE_BACK:
+            return op->ne[2];
+        default:
+            return ggml_nrows(op);
+    }
+}
+
+static bool ggml_backend_sched_is_cuda_host_buffer(ggml_backend_buffer_t buffer) {
+    return buffer != NULL && strstr(ggml_backend_buffer_name(buffer), "CUDA_Host") != NULL;
+}
+
+static const struct ggml_tensor * ggml_backend_sched_view_root(const struct ggml_tensor * tensor) {
+    while (tensor != NULL && tensor->view_src != NULL) {
+        tensor = tensor->view_src;
+    }
+    return tensor;
+}
+
+static bool ggml_backend_sched_is_staged_kv_input(
+        const struct ggml_tensor * tensor,
+        const struct ggml_tensor * consumer) {
+    if (getenv("LLAMA_KV_HOST_STAGE") == NULL ||
+        tensor == NULL || consumer == NULL || consumer->op != GGML_OP_FLASH_ATTN_EXT) {
+        return false;
+    }
+
+    const struct ggml_tensor * root = ggml_backend_sched_view_root(tensor);
+    return root != NULL &&
+           (strncmp(root->name, "cache_k_l", 9) == 0 || strncmp(root->name, "cache_v_l", 9) == 0);
+}
+
+static bool ggml_backend_sched_cuda_host_use_direct(
+        const struct ggml_tensor * tensor,
+        const struct ggml_tensor * op) {
+    const size_t max_bytes = ggml_backend_sched_cuda_host_direct_max_bytes();
+    if (tensor != NULL && max_bytes > 0 && ggml_nbytes(tensor) <= max_bytes) {
+        return true;
+    }
+    const int64_t batch = ggml_backend_sched_op_batch_size(op);
+    const int64_t max_batch = ggml_backend_sched_cuda_host_direct_max_batch();
+    const int64_t min_batch = ggml_backend_sched_cuda_host_direct_min_batch();
+    return (max_batch >= 0 && batch <= max_batch) ||
+           (min_batch >= 0 && batch >= min_batch);
+}
+
+static bool ggml_backend_sched_cuda_host_force_copy(
+        ggml_backend_sched_t sched,
+        ggml_backend_buffer_t buffer,
+        const struct ggml_tensor * tensor,
+        const struct ggml_tensor * consumer,
+        int backend_id) {
+    const bool dynamic_cuda_host =
+           ggml_backend_sched_cuda_host_direct_max_batch() >= 0 ||
+           ggml_backend_sched_cuda_host_direct_min_batch() >= 0 ||
+           ggml_backend_sched_cuda_host_direct_max_bytes() > 0;
+    return dynamic_cuda_host &&
+           backend_id < sched->n_backends - 1 &&
+           ggml_backend_sched_is_cuda_host_buffer(buffer) &&
+           consumer != NULL && consumer->op != GGML_OP_NONE &&
+           !ggml_backend_sched_cuda_host_use_direct(tensor, consumer);
+}
+
 static int ggml_backend_sched_backend_from_buffer(ggml_backend_sched_t sched, const struct ggml_tensor * tensor, const struct ggml_tensor * op) {
     ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
     if (buffer == NULL) {
         return -1;
     }
 
+    const bool dynamic_cuda_host =
+        (ggml_backend_sched_cuda_host_direct_max_batch() >= 0 ||
+         ggml_backend_sched_cuda_host_direct_min_batch() >= 0 ||
+         ggml_backend_sched_cuda_host_direct_max_bytes() > 0) &&
+        ggml_backend_sched_is_cuda_host_buffer(buffer);
+
     // find highest prio backend that supports the buffer type and the op
     for (int i = 0; i < sched->n_backends; i++) {
+        // Keep CUDA_Host leaves associated with the CPU backend.  A decode op
+        // can still consume the original mapped pointer directly, while a
+        // prefill op can request a temporary CUDA copy below.
+        if (dynamic_cuda_host && i < sched->n_backends - 1 &&
+            (op->op == GGML_OP_NONE || !ggml_backend_sched_cuda_host_use_direct(tensor, op))) {
+            continue;
+        }
         if (ggml_backend_supports_buft(sched->backends[i], buffer->buft) &&
             ggml_backend_supports_op(sched->backends[i], op)) {
             return i;
@@ -1023,7 +1547,11 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
     }
 }
 
-static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, struct ggml_tensor * t, int backend_id) {
+static bool ggml_backend_sched_buffer_supported(
+        ggml_backend_sched_t sched,
+        struct ggml_tensor * t,
+        int backend_id,
+        const struct ggml_tensor * consumer = NULL) {
     ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
     ggml_backend_buffer_type_t buft = NULL;
 
@@ -1039,6 +1567,27 @@ static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, stru
         if (tensor_backend_id != -1) {
             buft = sched->bufts[tensor_backend_id];
         }
+    }
+
+    if (backend_id < sched->n_backends - 1 &&
+        buf != NULL && ggml_backend_buffer_is_host(buf) &&
+        ggml_backend_sched_weight_cache_name_eligible(sched, t)) {
+        return false;
+    }
+
+    if (ggml_backend_sched_cuda_host_force_copy(sched, buf, t, consumer, backend_id)) {
+        return false;
+    }
+
+    // A host-resident KV cache can retain the full configured context in RAM
+    // while only the active K/V view is copied to a small reusable CUDA
+    // staging buffer for Flash Attention.  KV stores continue to use the
+    // mapped host allocation directly; only FA reads are forced through the
+    // scheduler copy path.
+    if (backend_id < sched->n_backends - 1 &&
+        ggml_backend_sched_is_cuda_host_buffer(buf) &&
+        ggml_backend_sched_is_staged_kv_input(t, consumer)) {
+        return false;
     }
 
     return buft != NULL && ggml_backend_supports_buft(sched->backends[backend_id], buft);
@@ -1069,6 +1618,104 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->ctx = ggml_init(params);
     if (sched->ctx == NULL) {
         GGML_ABORT("%s: failed to initialize context\n", __func__);
+    }
+    memset(sched->staging_roots, 0, sizeof(sched->staging_roots));
+    memset(sched->weight_cache_roots, 0, sizeof(sched->weight_cache_roots));
+
+    bool graph_prefill = false;
+    bool graph_has_target_gate = false;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const struct ggml_tensor * node = graph->nodes[i];
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            const struct ggml_tensor * src = node->src[j];
+            if (src != NULL && strcmp(src->name, "blk.0.ffn_gate.weight") == 0) {
+                graph_has_target_gate = true;
+                // Attention score tensors grow with KV length even for a
+                // one-token decode, so scanning arbitrary graph dimensions
+                // misclassifies long-context decode as prefill. The target
+                // gate matmul's token dimension is the actual graph batch.
+                const int64_t gate_batch = ggml_backend_sched_op_batch_size(node);
+                graph_prefill = gate_batch >= 32;
+                if (getenv("LLAMA_WEIGHT_CACHE_TRACE") != NULL) {
+                    fprintf(stderr,
+                            "WEIGHT_CACHE_GRAPH_GATE: node=%s op=%s ne=%lld,%lld,%lld,%lld batch=%lld\n",
+                            node->name, ggml_op_name(node->op),
+                            (long long) node->ne[0], (long long) node->ne[1],
+                            (long long) node->ne[2], (long long) node->ne[3],
+                            (long long) gate_batch);
+                    fflush(stderr);
+                }
+            }
+            if (src != NULL && strcmp(src->name, "output.weight") == 0) {
+                // Model weights have process lifetime and outlive scheduler
+                // graph contexts, so retaining this pointer is safe.
+                sched->weight_cache_alias_output = const_cast<struct ggml_tensor *>(src);
+            }
+        }
+    }
+    if (graph_prefill && graph_has_target_gate) {
+        // Only the target context sees the full backbone during prompt eval.
+        // The MTP draft context must not allocate a second 1 GiB cache.
+        sched->weight_cache_owner = true;
+    }
+
+    const bool alias_output = ggml_backend_sched_weight_cache_alias_output_enabled();
+    if (alias_output && sched->weight_cache_owner && sched->weight_cache_alias_output != NULL) {
+        // Decode graphs need the original output matrix from their start. A
+        // prefill graph restores it later, immediately before the split which
+        // consumes output.weight, after the cached early-layer gates are done.
+        if (sched->weight_cache_alias_dirty && !graph_prefill) {
+            const bool alias_had_entries = sched->weight_cache_n > 0;
+            ggml_backend_tensor_set(sched->weight_cache_alias_output,
+                    sched->weight_cache_alias_shadow, 0, sched->weight_cache_alias_size);
+            sched->weight_cache_alias_dirty = false;
+            sched->weight_cache_alias_completed = sched->weight_cache_alias_completed || alias_had_entries;
+            sched->weight_cache_n = 0;
+            sched->weight_cache_used = 0;
+            if (getenv("LLAMA_WEIGHT_CACHE_TRACE") != NULL) {
+                fprintf(stderr, "WEIGHT_CACHE_ALIAS_RESTORE: output.weight bytes=%zu\n",
+                        sched->weight_cache_alias_size);
+                fflush(stderr);
+            }
+        }
+
+        // The alias is a per-prefill scratch cache, not a one-shot process
+        // resource.  Server warmup also builds a prefill-shaped graph and used
+        // to set alias_completed permanently, which disabled the cache before
+        // the first real request.  A completed prefill always restores
+        // output.weight and clears the entries below, so it is safe to arm the
+        // alias again for the next genuine prefill.
+        sched->weight_cache_alias_can_fill = graph_prefill;
+        if (sched->weight_cache_alias_can_fill && sched->weight_cache_alias_shadow == NULL) {
+            sched->weight_cache_alias_size = ggml_nbytes(sched->weight_cache_alias_output);
+            sched->weight_cache_alias_shadow = malloc(sched->weight_cache_alias_size);
+            GGML_ASSERT(sched->weight_cache_alias_shadow != NULL);
+            ggml_backend_tensor_get(sched->weight_cache_alias_output,
+                    sched->weight_cache_alias_shadow, 0, sched->weight_cache_alias_size);
+            if (getenv("LLAMA_WEIGHT_CACHE_TRACE") != NULL) {
+                fprintf(stderr, "WEIGHT_CACHE_ALIAS_SHADOW: output.weight bytes=%zu\n",
+                        sched->weight_cache_alias_size);
+                fflush(stderr);
+            }
+        }
+    } else {
+        sched->weight_cache_alias_can_fill = false;
+    }
+    if (sched->weight_cache_owner &&
+        (!sched->weight_cache_phase_set || sched->weight_cache_prefill != graph_prefill)) {
+        sched->weight_cache_prefill = graph_prefill;
+        sched->weight_cache_phase_set = true;
+        // Alias entries remain valid across consecutive prompt chunks. They are
+        // cleared only when output.weight is restored. The ordinary dedicated
+        // cache retains the original phase-reset behavior.
+        if (!alias_output || !sched->weight_cache_alias_dirty) {
+            sched->weight_cache_n = 0;
+            sched->weight_cache_used = 0;
+        }
+        if (getenv("LLAMA_WEIGHT_CACHE_TRACE") != NULL) {
+            fprintf(stderr, "WEIGHT_CACHE_PHASE: %s\n", graph_prefill ? "prefill" : "decode");
+            fflush(stderr);
+        }
     }
 
     graph->uid = ggml_graph_next_uid();
@@ -1215,7 +1862,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         if (src == NULL) {
                             continue;
                         }
-                        if ((tensor_backend_id(src) != -1 || tensor_backend_id(src->view_src) != -1) && ggml_backend_sched_buffer_supported(sched, src, b)) {
+                        if ((tensor_backend_id(src) != -1 || tensor_backend_id(src->view_src) != -1) && ggml_backend_sched_buffer_supported(sched, src, b, node)) {
                             n_supported++;
                         }
                     }
@@ -1236,7 +1883,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         if (src == NULL) {
                             continue;
                         }
-                        if (!ggml_backend_sched_buffer_supported(sched, src, b)) {
+                        if (!ggml_backend_sched_buffer_supported(sched, src, b, node)) {
                             supported = false;
                             break;
                         }
@@ -1281,6 +1928,42 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             ggml_backend_sched_set_if_supported(sched, node, b, cur_backend_id);
         }
         GGML_ASSERT(*cur_backend_id != -1);
+
+        // Small decode matmuls backed by CUDA_Host weights normally remain on
+        // the CPU. Promote only the leading gates that fit completely in the
+        // persistent cache; the remaining gates keep the proven CPU path and
+        // therefore do not trigger per-token PCIe copies.
+        if (sched->weight_cache_owner &&
+            !sched->weight_cache_prefill &&
+            ggml_backend_sched_weight_cache_decode_gates_enabled()) {
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                const struct ggml_tensor * src = node->src[j];
+                if (!ggml_backend_sched_weight_cache_decode_gate_fits(src)) {
+                    continue;
+                }
+                for (int b = 0; b < sched->n_backends - 1; ++b) {
+                    if (ggml_backend_supports_op(sched->backends[b], node)) {
+                        *cur_backend_id = b;
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+
+        if (getenv("LLAMA_WEIGHT_CACHE_TRACE") != NULL) {
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                struct ggml_tensor * src = node->src[j];
+                if (src != NULL && strcmp(src->name, "blk.0.ffn_gate.weight") == 0) {
+                    fprintf(stderr,
+                            "WEIGHT_CACHE_ASSIGN: phase=%s node_backend=%s src_backend=%s\n",
+                            sched->weight_cache_prefill ? "prefill" : "decode",
+                            ggml_backend_name(sched->backends[*cur_backend_id]),
+                            ggml_backend_name(sched->backends[tensor_backend_id(src)]));
+                    fflush(stderr);
+                }
+            }
+        }
     }
 
     // pass 5: split graph, find tensors that need to be copied
@@ -1298,6 +1981,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
         split->i_start = 0;
         split->n_inputs = 0;
+        split->copy_id = sched->cur_copy;
+        split->staging_id = -1;
+        split->staging_used = 0;
+        int next_staging_id = 0;
         int cur_backend_id = split->backend_id;
         for (; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
@@ -1322,7 +2009,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     // by starting a new split, the memory of the previously offloaded weights can be reused
                     if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                         int src_backend_id = tensor_backend_id(src);
-                        if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                        const struct ggml_backend_sched_weight_cache_entry * cache_entry =
+                                ggml_backend_sched_weight_cache_find(sched, src);
+                        const bool cached_on_target = cache_entry != NULL && cache_entry->valid;
+                        if (src_backend_id != cur_backend_id &&
+                            !cached_on_target &&
+                            !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id, node)) {
                             need_new_split = true;
                             break;
                         }
@@ -1332,7 +2024,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     if (split->n_inputs >= split->inputs_capacity) {
                         const size_t id = hash_id(src);
                         int src_backend_id = sched->hv_tensor_backend_ids[id];
-                        bool supported = ggml_backend_sched_buffer_supported(sched, src, cur_backend_id);
+                        bool supported = ggml_backend_sched_buffer_supported(sched, src, cur_backend_id, node);
                         if (src_backend_id != cur_backend_id && tensor_id_copy(id, cur_backend_id, 0) == NULL && !supported) {
                             need_new_split = true;
                             break;
@@ -1356,6 +2048,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
                 split = &sched->splits[i_split];
                 split->backend_id = node_backend_id;
+                split->copy_id = sched->cur_copy;
+                split->staging_id = -1;
+                split->staging_used = 0;
                 split->i_start = i;
                 split->n_inputs = 0;
                 cur_backend_id = node_backend_id;
@@ -1396,14 +2091,52 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
                 }
 
-                if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id, node)) {
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
+                        struct ggml_backend_sched_weight_cache_entry * weight_cache_entry = NULL;
+                        if (cur_backend_id < sched->n_backends - 1 &&
+                            ggml_backend_sched_weight_cache_name_eligible(sched, src)) {
+                            weight_cache_entry = ggml_backend_sched_weight_cache_get_or_add(sched, src);
+                        }
+                        const bool staged_weight = sched->staging_double_buffer &&
+                                weight_cache_entry == NULL &&
+                                src->buffer != NULL &&
+                                src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                                ggml_backend_sched_is_cuda_host_buffer(src->buffer) &&
+                                cur_backend_id < sched->n_backends - 1;
+                        const bool staged_kv = sched->staging_double_buffer &&
+                                ggml_backend_sched_is_cuda_host_buffer(src->view_src ? src->view_src->buffer : src->buffer) &&
+                                ggml_backend_sched_is_staged_kv_input(src, node) &&
+                                cur_backend_id < sched->n_backends - 1;
+                        const bool staged_input = staged_weight || staged_kv;
+                        if (staged_input && split->staging_id < 0) {
+                            split->staging_id = next_staging_id;
+                            next_staging_id = (next_staging_id + 1) % sched->staging_slots;
+                        }
                         for (int c = 0; c < sched->n_copies; c++) {
                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
-                            if (sched->n_copies > 1) {
+                            const bool staging_galloc = getenv("LLAMA_STAGING_GALLOC") != NULL;
+                            if (weight_cache_entry != NULL) {
+                                if (ggml_backend_sched_weight_cache_alias_output_enabled() &&
+                                    sched->weight_cache_alias_output != NULL) {
+                                    tensor_copy->view_src = sched->weight_cache_alias_output;
+                                } else {
+                                    struct ggml_tensor * root = ggml_backend_sched_weight_cache_root(sched, cur_backend_id);
+                                    tensor_copy->view_src = root;
+                                }
+                                tensor_copy->view_offs = weight_cache_entry->offset;
+                            } else if (staged_input && !staging_galloc) {
+                                struct ggml_tensor * root = ggml_backend_sched_staging_root(sched, cur_backend_id, split->staging_id);
+                                const size_t alignment = 256;
+                                const size_t offset = (split->staging_used + alignment - 1) & ~(alignment - 1);
+                                GGML_ASSERT(offset + ggml_nbytes(tensor_copy) <= ggml_nbytes(root));
+                                tensor_copy->view_src = root;
+                                tensor_copy->view_offs = offset;
+                                split->staging_used = offset + ggml_nbytes(tensor_copy);
+                            } else if (!staged_input && sched->n_copies > 1) {
                                 ggml_set_input(tensor_copy);
                                 ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
                             }
@@ -1416,7 +2149,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         }
                         split->inputs[n_inputs] = src;
                     }
-                    node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
+                    node->src[j] = tensor_id_copy(src_id, cur_backend_id, split->copy_id);
                 }
             }
         }
@@ -1443,7 +2176,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < sched->n_splits; i++) {
         total_inputs += sched->splits[i].n_inputs;
     }
-    int graph_size = std::max(graph->n_nodes, graph->n_leafs) + total_inputs * 2 * sched->n_copies;
+    int graph_size = std::max(graph->n_nodes, graph->n_leafs) + total_inputs * 2 * sched->n_copies + sched->n_backends * 3;
 
     // remember the actual graph_size for performing reallocation checks later [GGML_SCHED_DEBUG_REALLOC]
     sched->debug_prev_graph_size = sched->debug_graph_size;
@@ -1475,7 +2208,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
             struct ggml_tensor * input = split->inputs[j];
             const size_t input_id = hash_id(input);
-            struct ggml_tensor * input_cpy = tensor_id_copy(input_id, split->backend_id, sched->cur_copy);
+            struct ggml_tensor * input_cpy = tensor_id_copy(input_id, split->backend_id, split->copy_id);
 
             // add a dependency to the input source so that it is not freed before the copy is done
             struct ggml_tensor * input_dep = ggml_view_tensor(sched->ctx, input);
@@ -1523,6 +2256,30 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
             }
         }
+    }
+
+    if (sched->staging_double_buffer) {
+        for (int b = 0; b < sched->n_backends; ++b) {
+            for (int c = 0; c < sched->staging_slots; ++c) {
+                struct ggml_tensor * root = sched->staging_roots[b][c];
+                if (root == NULL) {
+                    continue;
+                }
+                sched->leaf_backend_ids[graph_copy->n_leafs] = b;
+                assert(graph_copy->size > graph_copy->n_leafs);
+                graph_copy->leafs[graph_copy->n_leafs++] = root;
+            }
+        }
+    }
+
+    for (int b = 0; b < sched->n_backends; ++b) {
+        struct ggml_tensor * root = sched->weight_cache_roots[b];
+        if (root == NULL) {
+            continue;
+        }
+        sched->leaf_backend_ids[graph_copy->n_leafs] = b;
+        assert(graph_copy->size > graph_copy->n_leafs);
+        graph_copy->leafs[graph_copy->n_leafs++] = root;
     }
 
     // add leafs from the original graph
@@ -1591,6 +2348,400 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+static void * ggml_backend_sched_gate_ram_mirror(
+        ggml_backend_sched_t sched,
+        struct ggml_tensor * src) {
+    for (int i = 0; i < sched->gate_ram_mirror_n; ++i) {
+        struct ggml_backend_sched_gate_ram_mirror_entry * entry = &sched->gate_ram_mirrors[i];
+        if (entry->src == src) {
+            return entry->data;
+        }
+    }
+
+    GGML_ASSERT(sched->gate_ram_mirror_n < sched->gate_ram_mirror_capacity);
+    struct ggml_backend_sched_gate_ram_mirror_entry * entry =
+            &sched->gate_ram_mirrors[sched->gate_ram_mirror_n++];
+    entry->src = src;
+    entry->size = ggml_nbytes(src);
+    entry->data = ggml_aligned_malloc(entry->size);
+    if (entry->data == nullptr) {
+        --sched->gate_ram_mirror_n;
+        return nullptr;
+    }
+    memcpy(entry->data, src->data, entry->size);
+
+    if (getenv("LLAMA_CPU_GATE_RAM_MIRROR_TRACE") != nullptr) {
+        fprintf(stderr, "CPU_GATE_RAM_MIRROR: src=%s bytes=%zu count=%d\n",
+                src->name, ggml_nbytes(src), sched->gate_ram_mirror_n);
+        fflush(stderr);
+    }
+    return entry->data;
+}
+
+static const struct ggml_tensor * ggml_backend_sched_gate_wc_mirror(
+        ggml_backend_sched_t sched,
+        ggml_backend_t gpu_backend,
+        const struct ggml_tensor * src,
+        int64_t n_rows) {
+    if (getenv("LLAMA_STAGING_WC_MIRROR") == nullptr || src == nullptr || n_rows <= 0) {
+        return nullptr;
+    }
+    for (int i = 0; i < sched->gate_wc_mirror_n; ++i) {
+        struct ggml_backend_sched_gate_wc_mirror_entry * entry = &sched->gate_wc_mirrors[i];
+        if (entry->src == src && entry->n_rows == n_rows) {
+            return &entry->alias;
+        }
+    }
+
+    if (sched->gate_wc_mirror_n >= sched->gate_wc_mirror_capacity) {
+        return nullptr;
+    }
+
+    struct ggml_tensor prefix = *src;
+    prefix.ne[1] = n_rows;
+    prefix.ne[2] = 1;
+    prefix.ne[3] = 1;
+    const size_t bytes = ggml_nbytes(&prefix);
+
+    ggml_backend_buffer_type_t host_buft =
+            ggml_backend_dev_host_buffer_type(ggml_backend_get_device(gpu_backend));
+    if (host_buft == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(host_buft, bytes);
+    if (buffer == nullptr) {
+        return nullptr;
+    }
+
+    struct ggml_backend_sched_gate_wc_mirror_entry * entry =
+            &sched->gate_wc_mirrors[sched->gate_wc_mirror_n];
+    entry->src = src;
+    entry->n_rows = n_rows;
+    entry->buffer = buffer;
+    entry->alias = prefix;
+    entry->alias.buffer = buffer;
+    entry->alias.view_src = nullptr;
+    entry->alias.view_offs = 0;
+    entry->alias.data = ggml_backend_buffer_get_base(buffer);
+
+    // Copy once from the loader's ordinary mapped host allocation into a
+    // write-combined pinned prefix. The CPU keeps reading the untouched tail
+    // from the original tensor, while repeated H2D transfers use the mirror.
+    ggml_backend_tensor_get(src, entry->alias.data, 0, bytes);
+    ++sched->gate_wc_mirror_n;
+
+    if (getenv("LLAMA_STAGING_WC_MIRROR_TRACE") != nullptr) {
+        fprintf(stderr, "GATE_WC_MIRROR: src=%s rows=%lld bytes=%zu count=%d\n",
+                src->name, (long long) n_rows, bytes, sched->gate_wc_mirror_n);
+        fflush(stderr);
+    }
+    return &entry->alias;
+}
+
+static enum ggml_status ggml_backend_sched_compute_gate_row_split(
+        ggml_backend_sched_t sched,
+        struct ggml_backend_sched_split * split,
+        int cpu_backend_id,
+        int weight_src_id,
+        int gpu_percent,
+        struct ggml_backend_sched_gate_row_split_pending * pending,
+        struct ggml_backend_sched_gate_row_split_prefetch * prefetch) {
+    struct ggml_tensor * node = split->graph.nodes[0];
+    struct ggml_tensor * weight = node->src[weight_src_id];
+    struct ggml_tensor * input_cpu = node->src[weight_src_id == 0 ? 1 : 0];
+
+    if (node->op != GGML_OP_MUL_MAT || weight->ne[2] != 1 || weight->ne[3] != 1 || input_cpu == nullptr ||
+            node->type != GGML_TYPE_F32 || input_cpu->type != GGML_TYPE_F32) {
+        return GGML_STATUS_FAILED;
+    }
+
+    int gpu_backend_id = -1;
+    for (int backend_id = 0; backend_id < sched->n_backends; ++backend_id) {
+        if (ggml_backend_dev_type(ggml_backend_get_device(sched->backends[backend_id])) ==
+                GGML_BACKEND_DEVICE_TYPE_GPU) {
+            gpu_backend_id = backend_id;
+            break;
+        }
+    }
+    if (gpu_backend_id < 0) {
+        return GGML_STATUS_FAILED;
+    }
+
+    struct ggml_tensor * input_gpu = nullptr;
+    for (int input_id = 0; input_id < split->n_inputs; ++input_id) {
+        struct ggml_tensor * candidate = split->inputs[input_id];
+        if (tensor_copy(candidate, cpu_backend_id, split->copy_id) == input_cpu) {
+            input_gpu = candidate;
+            break;
+        }
+    }
+    if (input_gpu == nullptr) {
+        return GGML_STATUS_FAILED;
+    }
+
+    const int64_t n_in = weight->ne[0];
+    const int64_t n_out = weight->ne[1];
+    const int64_t n_batch = input_cpu->ne[1];
+    int64_t n_gpu = (n_out * std::max(5, std::min(95, gpu_percent))) / 100;
+    n_gpu = std::max<int64_t>(256, (n_gpu / 256) * 256);
+    n_gpu = std::min<int64_t>(n_out - 256, n_gpu);
+    const int64_t n_cpu = n_out - n_gpu;
+    if (n_cpu <= 0 || n_batch <= 0 || n_batch >= 32) {
+        return GGML_STATUS_FAILED;
+    }
+
+    ggml_backend_t cpu_backend = sched->backends[cpu_backend_id];
+    ggml_backend_t gpu_backend = sched->backends[gpu_backend_id];
+
+    auto ensure_buffer = [](ggml_backend_buffer_t & buffer, size_t & capacity,
+                            ggml_backend_t backend, struct ggml_tensor * tensor) {
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
+        const size_t needed = ggml_backend_buft_get_alloc_size(buft, tensor);
+        if (buffer != nullptr && capacity < needed) {
+            ggml_backend_synchronize(backend);
+            ggml_backend_buffer_free(buffer);
+            buffer = nullptr;
+            capacity = 0;
+        }
+        if (buffer == nullptr) {
+            buffer = ggml_backend_alloc_buffer(backend, needed);
+            if (buffer == nullptr) {
+                return false;
+            }
+            capacity = ggml_backend_buffer_get_size(buffer);
+        }
+        return ggml_backend_tensor_alloc(buffer, tensor, ggml_backend_buffer_get_base(buffer)) ==
+                GGML_STATUS_SUCCESS;
+    };
+
+    struct ggml_backend_sched_gate_row_split_plan * plan = sched->gate_split_plans[n_batch];
+    if (plan == nullptr) {
+        plan = new (std::nothrow) ggml_backend_sched_gate_row_split_plan {};
+        if (plan == nullptr) {
+            return GGML_STATUS_ALLOC_FAILED;
+        }
+
+        struct ggml_init_params params = {
+            /* .mem_size   = */ 1024*1024,
+            /* .mem_buffer = */ nullptr,
+            /* .no_alloc   = */ true,
+        };
+        plan->ctx = ggml_init(params);
+        if (plan->ctx == nullptr) {
+            delete plan;
+            return GGML_STATUS_ALLOC_FAILED;
+        }
+
+        auto make_alias_2d = [&](const struct ggml_tensor * src, int64_t ne0, int64_t ne1, size_t offset) {
+            struct ggml_tensor * alias = ggml_new_tensor_2d(plan->ctx, src->type, ne0, ne1);
+            alias->buffer = src->buffer;
+            alias->data = (char *) src->data + offset;
+            alias->nb[0] = src->nb[0];
+            alias->nb[1] = src->nb[1];
+            alias->nb[2] = src->nb[2];
+            alias->nb[3] = src->nb[3];
+            alias->extra = src->extra;
+            return alias;
+        };
+
+        plan->weight_cpu = make_alias_2d(weight, n_in, n_cpu, (size_t) n_gpu * weight->nb[1]);
+        plan->input_cpu  = make_alias_2d(input_cpu, n_in, n_batch, 0);
+        plan->output_cpu = ggml_mul_mat(plan->ctx, plan->weight_cpu, plan->input_cpu);
+        plan->input_gpu  = make_alias_2d(input_gpu, n_in, n_batch, 0);
+        ggml_set_name(plan->output_cpu, "gate_row_split.output_cpu");
+        for (int slot = 0; slot < 2; ++slot) {
+            plan->weight_gpu[slot] = ggml_new_tensor_2d(plan->ctx, weight->type, n_in, n_gpu);
+            plan->output_gpu[slot] = ggml_mul_mat(plan->ctx, plan->weight_gpu[slot], plan->input_gpu);
+            ggml_format_name(plan->weight_gpu[slot], "gate_row_split.weight_gpu_%d", slot);
+            ggml_format_name(plan->output_gpu[slot], "gate_row_split.output_gpu_%d", slot);
+        }
+
+        // Allocate for the largest decode microbatch up front.  This keeps the
+        // shared buffers stable if speculative decoding later changes batch
+        // size, so already cached plans retain valid output pointers.
+        struct ggml_tensor * output_cpu_max = ggml_new_tensor_2d(plan->ctx, GGML_TYPE_F32, n_cpu, 31);
+        struct ggml_tensor * output_gpu_max = ggml_new_tensor_2d(plan->ctx, GGML_TYPE_F32, n_gpu, 31);
+        if (!ensure_buffer(sched->gate_split_cpu_output_buffer,
+                           sched->gate_split_cpu_output_capacity, cpu_backend, output_cpu_max) ||
+            !ensure_buffer(sched->gate_split_gpu_weight_buffer[0],
+                           sched->gate_split_gpu_weight_capacity[0], gpu_backend, plan->weight_gpu[0]) ||
+            !ensure_buffer(sched->gate_split_gpu_weight_buffer[1],
+                           sched->gate_split_gpu_weight_capacity[1], gpu_backend, plan->weight_gpu[1]) ||
+            !ensure_buffer(sched->gate_split_gpu_output_buffer,
+                           sched->gate_split_gpu_output_capacity, gpu_backend, output_gpu_max) ||
+            ggml_backend_tensor_alloc(sched->gate_split_cpu_output_buffer, plan->output_cpu,
+                    ggml_backend_buffer_get_base(sched->gate_split_cpu_output_buffer)) != GGML_STATUS_SUCCESS ||
+            ggml_backend_tensor_alloc(sched->gate_split_gpu_output_buffer, plan->output_gpu[0],
+                    ggml_backend_buffer_get_base(sched->gate_split_gpu_output_buffer)) != GGML_STATUS_SUCCESS ||
+            ggml_backend_tensor_alloc(sched->gate_split_gpu_output_buffer, plan->output_gpu[1],
+                    ggml_backend_buffer_get_base(sched->gate_split_gpu_output_buffer)) != GGML_STATUS_SUCCESS) {
+            ggml_free(plan->ctx);
+            delete plan;
+            return GGML_STATUS_ALLOC_FAILED;
+        }
+
+        plan->graph_cpu = ggml_new_graph_custom(plan->ctx, 8, false);
+        ggml_build_forward_expand(plan->graph_cpu, plan->output_cpu);
+        for (int slot = 0; slot < 2; ++slot) {
+            plan->graph_gpu[slot] = ggml_new_graph_custom(plan->ctx, 8, false);
+            ggml_build_forward_expand(plan->graph_gpu[slot], plan->output_gpu[slot]);
+        }
+        plan->n_in = n_in;
+        plan->n_out = n_out;
+        plan->n_batch = n_batch;
+        plan->n_gpu = n_gpu;
+        sched->gate_split_plans[n_batch] = plan;
+    } else if (plan->n_in != n_in || plan->n_out != n_out || plan->n_gpu != n_gpu) {
+        // The cache is intentionally shape-specific.  Qwen's dense FFN layers
+        // share a shape; fail closed rather than reusing metadata incorrectly.
+        return GGML_STATUS_FAILED;
+    }
+
+    auto refresh_alias = [](struct ggml_tensor * alias, const struct ggml_tensor * src, size_t offset) {
+        alias->buffer = src->buffer;
+        alias->data = (char *) src->data + offset;
+        alias->nb[0] = src->nb[0];
+        alias->nb[1] = src->nb[1];
+        alias->nb[2] = src->nb[2];
+        alias->nb[3] = src->nb[3];
+        alias->extra = src->extra;
+    };
+    refresh_alias(plan->weight_cpu, weight, (size_t) n_gpu * weight->nb[1]);
+    refresh_alias(plan->input_cpu, input_cpu, 0);
+    refresh_alias(plan->input_gpu, input_gpu, 0);
+
+    const size_t gpu_output_bytes = ggml_nbytes(plan->output_gpu[0]);
+    if (sched->gate_split_gpu_output_host_capacity < gpu_output_bytes) {
+        void * resized = realloc(sched->gate_split_gpu_output_host, gpu_output_bytes);
+        if (resized == nullptr) {
+            return GGML_STATUS_ALLOC_FAILED;
+        }
+        sched->gate_split_gpu_output_host = resized;
+        sched->gate_split_gpu_output_host_capacity = gpu_output_bytes;
+    }
+
+    GGML_ASSERT(pending != nullptr && !pending->active);
+    const int64_t begin_us = ggml_time_us();
+    sched->cpu_gpu_overlap->submit(cpu_backend, *plan->graph_cpu);
+
+    int slot = 0;
+    const bool prefetched = prefetch != nullptr && prefetch->weight == weight &&
+            prefetch->n_gpu == n_gpu && prefetch->slot >= 0;
+    if (prefetched) {
+        slot = prefetch->slot;
+        *prefetch = {};
+        prefetch->slot = -1;
+    } else {
+        struct ggml_tensor weight_gpu_src = *weight;
+        weight_gpu_src.ne[1] = n_gpu;
+        weight_gpu_src.ne[2] = 1;
+        weight_gpu_src.ne[3] = 1;
+        snprintf(weight_gpu_src.name, sizeof(weight_gpu_src.name), "%s.row_split", weight->name);
+        const struct ggml_tensor * weight_gpu_copy_src = &weight_gpu_src;
+        if (const struct ggml_tensor * mirror =
+                ggml_backend_sched_gate_wc_mirror(sched, gpu_backend, weight, n_gpu)) {
+            weight_gpu_copy_src = mirror;
+        }
+        bool copied_async = gpu_backend->iface.cpy_tensor_async &&
+                gpu_backend->iface.cpy_tensor_async(
+                        cpu_backend, gpu_backend, weight_gpu_copy_src, plan->weight_gpu[slot]);
+        if (!copied_async) {
+            ggml_backend_tensor_copy(weight_gpu_copy_src, plan->weight_gpu[slot]);
+        }
+    }
+    pending->active = true;
+    pending->plan = plan;
+    pending->output = node;
+    pending->gpu_backend = gpu_backend;
+    pending->gpu_status = ggml_backend_graph_compute_async(gpu_backend, plan->graph_gpu[slot]);
+    pending->gpu_percent = gpu_percent;
+    pending->n_gpu = n_gpu;
+    pending->n_cpu = n_cpu;
+    pending->n_batch = n_batch;
+    pending->gpu_output_bytes = gpu_output_bytes;
+    pending->begin_us = begin_us;
+    pending->slot = slot;
+    return GGML_STATUS_SUCCESS;
+}
+
+static enum ggml_status ggml_backend_sched_finish_gate_row_split(
+        ggml_backend_sched_t sched,
+        struct ggml_backend_sched_gate_row_split_pending * pending,
+        struct ggml_tensor * output_gpu_dst,
+        bool * direct_gpu_ready) {
+    GGML_ASSERT(pending != nullptr && pending->active);
+    if (direct_gpu_ready != nullptr) {
+        *direct_gpu_ready = false;
+    }
+    const bool direct_gpu = output_gpu_dst != nullptr &&
+            getenv("LLAMA_CPU_GPU_GATE_DIRECT_GPU") != nullptr &&
+            output_gpu_dst->type == GGML_TYPE_F32 &&
+            output_gpu_dst->ne[0] == pending->n_gpu + pending->n_cpu &&
+            output_gpu_dst->ne[1] == pending->n_batch;
+    const enum ggml_status cpu_status = sched->cpu_gpu_overlap->wait();
+
+    if (pending->gpu_status == GGML_STATUS_SUCCESS && cpu_status == GGML_STATUS_SUCCESS) {
+        if (direct_gpu) {
+            // The GPU prefix is already on-device.  Copy it directly into the
+            // scheduler's imported gate tensor and upload only the CPU tail.
+            // Both operations are queued on the same CUDA stream as the
+            // following FFN suffix, preserving dependencies without the old
+            // GPU->CPU->GPU round trip or changing any numerical operation.
+            struct ggml_tensor gpu_prefix_dst = *output_gpu_dst;
+            gpu_prefix_dst.ne[0] = pending->n_gpu;
+            gpu_prefix_dst.ne[1] = pending->n_batch;
+            gpu_prefix_dst.ne[2] = 1;
+            gpu_prefix_dst.ne[3] = 1;
+
+            struct ggml_tensor * gpu_prefix_src = pending->plan->output_gpu[pending->slot];
+            const bool copied_gpu = pending->gpu_backend->iface.cpy_tensor_async != nullptr &&
+                    pending->gpu_backend->iface.cpy_tensor_async(
+                            pending->gpu_backend, pending->gpu_backend,
+                            gpu_prefix_src, &gpu_prefix_dst);
+            if (copied_gpu) {
+                ggml_backend_tensor_set_2d_async(
+                        pending->gpu_backend, output_gpu_dst,
+                        pending->plan->output_cpu->data,
+                        (size_t) pending->n_gpu*sizeof(float),
+                        (size_t) pending->n_cpu*sizeof(float),
+                        (size_t) pending->n_batch,
+                        output_gpu_dst->nb[1], pending->plan->output_cpu->nb[1]);
+                if (direct_gpu_ready != nullptr) {
+                    *direct_gpu_ready = true;
+                }
+            }
+        }
+
+        if (direct_gpu_ready == nullptr || !*direct_gpu_ready) {
+            ggml_backend_tensor_get(pending->plan->output_gpu[pending->slot], sched->gate_split_gpu_output_host,
+                    0, pending->gpu_output_bytes);
+            const float * gpu_data = (const float *) sched->gate_split_gpu_output_host;
+            const float * cpu_data = (const float *) pending->plan->output_cpu->data;
+            for (int64_t ib = 0; ib < pending->n_batch; ++ib) {
+                float * dst = (float *) ((char *) pending->output->data + ib * pending->output->nb[1]);
+                memcpy(dst, gpu_data + ib*pending->n_gpu, (size_t) pending->n_gpu*sizeof(float));
+                memcpy(dst + pending->n_gpu, cpu_data + ib*pending->n_cpu,
+                        (size_t) pending->n_cpu*sizeof(float));
+            }
+        }
+    }
+
+    if (getenv("LLAMA_CPU_GPU_GATE_ROW_SPLIT_TRACE") != nullptr) {
+        fprintf(stderr,
+                "CPU_GPU_GATE_ROW_SPLIT: gpu_pct=%d rows_gpu=%lld rows_cpu=%lld batch=%lld total_ms=%.3f gpu_status=%d cpu_status=%d direct_gpu=%d\n",
+                pending->gpu_percent, (long long) pending->n_gpu, (long long) pending->n_cpu,
+                (long long) pending->n_batch, (ggml_time_us() - pending->begin_us)/1000.0,
+                (int) pending->gpu_status, (int) cpu_status,
+                direct_gpu_ready != nullptr && *direct_gpu_ready ? 1 : 0);
+        fflush(stderr);
+    }
+
+    const enum ggml_status status = pending->gpu_status != GGML_STATUS_SUCCESS ?
+            pending->gpu_status : cpu_status;
+    *pending = {};
+    return status;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1600,17 +2751,119 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<ggml_bitset_t> used_ids;
 
     int prev_backend_id = -1;
+    int prev_copy_id = 0;
+    const bool cpu_gate_timing = getenv("LLAMA_CPU_GATE_TIMING") != NULL;
+    const bool cpu_gpu_ffn_overlap = sched->cpu_gpu_overlap != NULL &&
+            getenv("LLAMA_CPU_GPU_FFN_OVERLAP") != NULL && sched->callback_eval == NULL;
+    const bool cpu_gate_ram_mirror = getenv("LLAMA_CPU_GATE_RAM_MIRROR") != NULL;
+    const int cpu_gpu_gate_row_split = getenv("LLAMA_CPU_GPU_GATE_ROW_SPLIT") != NULL ?
+            atoi(getenv("LLAMA_CPU_GPU_GATE_ROW_SPLIT")) : 0;
+    const bool cpu_gpu_ffn_overlap_trace = getenv("LLAMA_CPU_GPU_FFN_OVERLAP_TRACE") != NULL;
+    int64_t cpu_gate_total_us = 0;
+    int cpu_gate_splits = 0;
+    struct ggml_tensor * pending_cpu_gate = nullptr;
+    struct ggml_tensor * pending_cpu_gate_weight = nullptr;
+    void * pending_cpu_gate_weight_data = nullptr;
+    int pending_cpu_backend_id = -1;
+    int overlap_pairs = 0;
+    int overlap_prefix_nodes = 0;
+    struct ggml_backend_sched_gate_row_split_pending pending_gate_split = {};
+    struct ggml_backend_sched_gate_row_split_prefetch gate_prefetch = {};
+    gate_prefetch.slot = -1;
+
+    auto wait_pending_cpu_gate = [&](struct ggml_tensor * output_gpu_dst = nullptr,
+                                     bool * direct_gpu_ready = nullptr) -> enum ggml_status {
+        if (pending_cpu_gate == nullptr) {
+            return GGML_STATUS_SUCCESS;
+        }
+        const enum ggml_status status = pending_gate_split.active ?
+                ggml_backend_sched_finish_gate_row_split(
+                        sched, &pending_gate_split, output_gpu_dst, direct_gpu_ready) :
+                sched->cpu_gpu_overlap->wait();
+        if (pending_cpu_gate_weight != nullptr) {
+            pending_cpu_gate_weight->data = pending_cpu_gate_weight_data;
+        }
+        pending_cpu_gate = nullptr;
+        pending_cpu_gate_weight = nullptr;
+        pending_cpu_gate_weight_data = nullptr;
+        pending_cpu_backend_id = -1;
+        return status;
+    };
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
+        // A pending CPU gate may overlap only with the immediately following
+        // GPU split which imports that gate.  If graph splitting ever produces
+        // a different shape, conservatively join and use the ordinary path.
+        int overlap_gate_input_id = -1;
+        if (pending_cpu_gate != nullptr &&
+                ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            for (int input_id = 0; input_id < split->n_inputs; ++input_id) {
+                if (split->inputs[input_id] == pending_cpu_gate) {
+                    overlap_gate_input_id = input_id;
+                    break;
+                }
+            }
+        }
+        if (pending_cpu_gate != nullptr && overlap_gate_input_id < 0) {
+            const enum ggml_status status = wait_pending_cpu_gate();
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
+            }
+        }
+
+        bool split_uses_alias_output = false;
+        if (sched->weight_cache_alias_dirty && sched->weight_cache_alias_output != NULL) {
+            for (int node_id = 0; node_id < split->graph.n_nodes && !split_uses_alias_output; ++node_id) {
+                const struct ggml_tensor * node = split->graph.nodes[node_id];
+                for (int src_id = 0; src_id < GGML_MAX_SRC; ++src_id) {
+                    const struct ggml_tensor * src = node->src[src_id];
+                    if ((src == sched->weight_cache_alias_output ||
+                         (src != NULL && strcmp(src->name, "output.weight") == 0)) &&
+                        ggml_backend_sched_op_batch_size(node) > 0) {
+                        split_uses_alias_output = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (split_uses_alias_output) {
+            // It is only safe to restore once all alias-backed inputs belong to
+            // earlier splits. A staging split which also consumes one would see
+            // its gate overwritten by output.weight.
+            for (int input_id = 0; input_id < split->n_inputs; ++input_id) {
+                struct ggml_backend_sched_weight_cache_entry * entry =
+                        ggml_backend_sched_weight_cache_find(sched, split->inputs[input_id]);
+                if (entry != NULL && entry->valid) {
+                    fprintf(stderr, "WEIGHT_CACHE_ALIAS_UNSAFE_SPLIT: id=%d input=%s\n",
+                            split_id, split->inputs[input_id]->name);
+                    fflush(stderr);
+                    return GGML_STATUS_FAILED;
+                }
+            }
+            const bool alias_had_entries = sched->weight_cache_n > 0;
+            ggml_backend_synchronize(split_backend);
+            ggml_backend_tensor_set(sched->weight_cache_alias_output,
+                    sched->weight_cache_alias_shadow, 0, sched->weight_cache_alias_size);
+            sched->weight_cache_alias_dirty = false;
+            sched->weight_cache_alias_completed = sched->weight_cache_alias_completed || alias_had_entries;
+            sched->weight_cache_n = 0;
+            sched->weight_cache_used = 0;
+            if (getenv("LLAMA_WEIGHT_CACHE_TRACE") != NULL) {
+                fprintf(stderr, "WEIGHT_CACHE_ALIAS_RESTORE_SPLIT: id=%d output.weight bytes=%zu\n",
+                        split_id, sched->weight_cache_alias_size);
+                fflush(stderr);
+            }
+        }
+
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
-            if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
-                ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
+            if (sched->events[prev_backend_id][prev_copy_id] != NULL) {
+                ggml_backend_event_synchronize(sched->events[prev_backend_id][prev_copy_id]);
             } else {
                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
             }
@@ -1618,22 +2871,59 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+            // Defer the tiny CPU gate activation.  The GPU prefix before its
+            // first consumer is independent and can execute while the host
+            // worker is still producing the activation.
+            if (input_id == overlap_gate_input_id) {
+                continue;
+            }
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
-            struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+            struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, split->copy_id);
+            struct ggml_backend_sched_weight_cache_entry * weight_cache_entry =
+                    ggml_backend_sched_weight_cache_find(sched, input);
+            const bool weight_cached = weight_cache_entry != NULL &&
+                    input_cpy->view_src != NULL &&
+                    (strncmp(input_cpy->view_src->name, "weight_cache_root_", 18) == 0 ||
+                     input_cpy->view_src == sched->weight_cache_alias_output);
+            if (weight_cached && weight_cache_entry->valid) {
+                continue;
+            }
+            const bool staged_input = sched->staging_double_buffer && split->staging_id >= 0 &&
+                    input->buffer != NULL &&
+                    input->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                    ggml_backend_sched_is_cuda_host_buffer(input->buffer) &&
+                    split_backend_id < sched->n_backends - 1;
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                    ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                if (sched->events[split_backend_id][split->copy_id] != NULL) {
+                    ggml_backend_event_synchronize(sched->events[split_backend_id][split->copy_id]);
                 } else {
                     ggml_backend_synchronize(split_backend);
                 }
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
                 // wait for the split backend to finish using the input before overwriting it
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                    ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+                if (staged_input) {
+                    // A staging slot can be overwritten as soon as the previous
+                    // compute that consumed that slot has completed.  The other
+                    // slot may still be executing, which is the overlap we want.
+                    const int staging_id = split->staging_id;
+                    if (sched->staging_event_recorded[split_backend_id][staging_id]) {
+                        // The CUDA copy stream can wait on the gate-consumed
+                        // event without blocking the scheduler thread. The
+                        // legacy host synchronization remains the fallback.
+                        if (!ggml_backend_sched_staging_device_reuse_wait_enabled()) {
+                            ggml_backend_event_synchronize(sched->staging_events[split_backend_id][staging_id]);
+                        }
+                    }
+                } else if (sched->events[split_backend_id][split->copy_id] != NULL) {
+                    if (sched->staging_double_buffer) {
+                        ggml_backend_event_synchronize(sched->events[split_backend_id][split->copy_id]);
+                    } else {
+                        ggml_backend_event_wait(split_backend, sched->events[split_backend_id][split->copy_id]);
+                    }
                 } else {
                     ggml_backend_synchronize(split_backend);
                 }
@@ -1659,7 +2949,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // if the ids tensor is also an input of the split, it may not have been copied yet to the split backend
                     // in that case, we use the original ids tensor
                     for (int i = input_id + 1; i < split->n_inputs; i++) {
-                        if (ids_tensor == tensor_copy(split->inputs[i], split_backend_id, sched->cur_copy)) {
+                        if (ids_tensor == tensor_copy(split->inputs[i], split_backend_id, split->copy_id)) {
                             ids_tensor = split->inputs[i];
                             ids_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[i]);
                             break;
@@ -1728,19 +3018,255 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
                         ggml_backend_synchronize(input_backend);
-                        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                        if (sched->events[split_backend_id][split->copy_id] != NULL) {
+                            ggml_backend_event_synchronize(sched->events[split_backend_id][split->copy_id]);
                         } else {
                             ggml_backend_synchronize(split_backend);
                         }
                         ggml_backend_tensor_copy(input, input_cpy);
+                        if (sched->staging_double_buffer) {
+                            ggml_backend_synchronize(split_backend);
+                        }
                     }
+                }
+            }
+            if (weight_cached) {
+                weight_cache_entry->valid = true;
+                if (!ggml_backend_sched_weight_cache_alias_output_enabled() && sched->weight_cache_prefill) {
+                    const bool filled_output = strcmp(input->name, "output.weight") == 0;
+                    const bool filled_gate = strstr(input->name, ".ffn_gate.weight") != NULL &&
+                                             strncmp(input->name, "blk.", 4) == 0;
+                    if (filled_output) {
+                        // output.weight overlaps every cached gate at offset 0.
+                        for (int i = 0; i < sched->weight_cache_n; ++i) {
+                            if (&sched->weight_cache_entries[i] != weight_cache_entry) {
+                                sched->weight_cache_entries[i].valid = false;
+                            }
+                        }
+                    } else if (filled_gate) {
+                        // A new prompt graph has overwritten a portion of the
+                        // previous output matrix, so force output to refill.
+                        for (int i = 0; i < sched->weight_cache_n; ++i) {
+                            if (strcmp(sched->weight_cache_entries[i].src->name, "output.weight") == 0) {
+                                sched->weight_cache_entries[i].valid = false;
+                            }
+                        }
+                    }
+                }
+                if (input_cpy->view_src == sched->weight_cache_alias_output) {
+                    sched->weight_cache_alias_dirty = true;
+                }
+                if (getenv("LLAMA_WEIGHT_CACHE_TRACE") != NULL) {
+                    fprintf(stderr, "WEIGHT_CACHE_FILL: %s offset=%zu bytes=%zu\n",
+                            input->name, weight_cache_entry->offset, ggml_nbytes(input));
+                    fflush(stderr);
                 }
             }
         }
 
         if (!sched->callback_eval) {
-            enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            if (sched->staging_double_buffer && getenv("LLAMA_STAGING_TRACE") != NULL) {
+                const ggml_tensor * first = split->graph.n_nodes > 0 ? split->graph.nodes[0] : NULL;
+                fprintf(stderr, "STAGING_SPLIT: id=%d copy=%d staging=%d nodes=%d first=%s op=%s inputs=%d\n",
+                        split_id, split->copy_id, split->staging_id, split->graph.n_nodes,
+                        first ? first->name : "<none>", first ? ggml_op_name(first->op) : "<none>", split->n_inputs);
+                for (int ti = 0; ti < split->n_inputs; ++ti) {
+                    fprintf(stderr, "  STAGING_INPUT: %s bytes=%zu\n",
+                            split->inputs[ti]->name, ggml_nbytes(split->inputs[ti]));
+                }
+                fflush(stderr);
+            }
+            bool timed_cpu_gate = false;
+            bool decode_cpu_gate = false;
+            if (cpu_gate_timing &&
+                    ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                for (int node_id = 0; node_id < split->graph.n_nodes && !timed_cpu_gate; ++node_id) {
+                    const struct ggml_tensor * node = split->graph.nodes[node_id];
+                    if (ggml_backend_sched_op_batch_size(node) >= 32) {
+                        continue;
+                    }
+                    for (int src_id = 0; src_id < GGML_MAX_SRC; ++src_id) {
+                        const struct ggml_tensor * src = node->src[src_id];
+                        if (src != NULL && strstr(src->name, ".ffn_gate.weight") != NULL) {
+                            timed_cpu_gate = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            int decode_cpu_gate_weight_src = -1;
+            if ((cpu_gpu_ffn_overlap || cpu_gate_ram_mirror || cpu_gpu_gate_row_split > 0) &&
+                    ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU &&
+                    split->graph.n_nodes == 1 &&
+                    ggml_backend_sched_op_batch_size(split->graph.nodes[0]) < 32) {
+                const struct ggml_tensor * node = split->graph.nodes[0];
+                for (int src_id = 0; src_id < GGML_MAX_SRC; ++src_id) {
+                    const struct ggml_tensor * src = node->src[src_id];
+                    if (src != NULL && strstr(src->name, ".ffn_gate.weight") != NULL) {
+                        decode_cpu_gate = true;
+                        decode_cpu_gate_weight_src = src_id;
+                        break;
+                    }
+                }
+            }
+            struct ggml_tensor * decode_gate_weight = decode_cpu_gate_weight_src >= 0 ?
+                    split->graph.nodes[0]->src[decode_cpu_gate_weight_src] : nullptr;
+            void * decode_gate_weight_original_data = decode_gate_weight != nullptr ? decode_gate_weight->data : nullptr;
+            if (decode_cpu_gate && cpu_gate_ram_mirror && cpu_gpu_gate_row_split <= 0) {
+                void * mirror_data = ggml_backend_sched_gate_ram_mirror(sched, decode_gate_weight);
+                if (mirror_data == nullptr) {
+                    return GGML_STATUS_ALLOC_FAILED;
+                }
+                decode_gate_weight->data = mirror_data;
+            }
+            const int64_t cpu_gate_begin_us = timed_cpu_gate ? ggml_time_us() : 0;
+            enum ggml_status ec = GGML_STATUS_SUCCESS;
+
+            if (decode_cpu_gate && cpu_gpu_gate_row_split > 0) {
+                GGML_ASSERT(pending_cpu_gate == nullptr && !pending_gate_split.active);
+                ec = ggml_backend_sched_compute_gate_row_split(
+                        sched, split, split_backend_id,
+                        decode_cpu_gate_weight_src, cpu_gpu_gate_row_split,
+                        &pending_gate_split, &gate_prefetch);
+                if (ec == GGML_STATUS_SUCCESS) {
+                    pending_cpu_gate = split->graph.nodes[split->graph.n_nodes - 1];
+                    pending_cpu_backend_id = split_backend_id;
+                }
+            } else if (decode_cpu_gate && cpu_gpu_ffn_overlap) {
+                GGML_ASSERT(pending_cpu_gate == nullptr);
+                sched->cpu_gpu_overlap->submit(split_backend, split->graph);
+                pending_cpu_gate = split->graph.nodes[split->graph.n_nodes - 1];
+                pending_cpu_backend_id = split_backend_id;
+                pending_cpu_gate_weight = decode_gate_weight;
+                pending_cpu_gate_weight_data = decode_gate_weight_original_data;
+            } else if (overlap_gate_input_id >= 0) {
+                struct ggml_tensor * gate_input = split->inputs[overlap_gate_input_id];
+                struct ggml_tensor * gate_input_cpy = tensor_copy(
+                        gate_input, split_backend_id, split->copy_id);
+                struct ggml_backend_sched_gate_row_split_plan * completed_gate_plan =
+                        pending_gate_split.active ? pending_gate_split.plan : nullptr;
+                const int completed_gate_slot = pending_gate_split.active ? pending_gate_split.slot : -1;
+
+                int prefix_end = 0;
+                for (; prefix_end < split->graph.n_nodes; ++prefix_end) {
+                    const struct ggml_tensor * node = split->graph.nodes[prefix_end];
+                    bool consumes_gate = false;
+                    for (int src_id = 0; src_id < GGML_MAX_SRC; ++src_id) {
+                        if (node->src[src_id] == gate_input_cpy) {
+                            consumes_gate = true;
+                            break;
+                        }
+                    }
+                    if (consumes_gate) {
+                        break;
+                    }
+                }
+
+                if (prefix_end > 0) {
+                    struct ggml_cgraph prefix = ggml_graph_view(&split->graph, 0, prefix_end);
+                    ec = ggml_backend_graph_compute_async(split_backend, &prefix);
+                }
+
+                if (ec == GGML_STATUS_SUCCESS) {
+                    bool direct_gate_gpu_ready = false;
+                    ec = wait_pending_cpu_gate(gate_input_cpy, &direct_gate_gpu_ready);
+
+                    if (ec == GGML_STATUS_SUCCESS && !direct_gate_gpu_ready) {
+                        ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, gate_input);
+                        // The custom CUDA staging path enqueues the H2D copy on its
+                        // copy stream and inserts a wait after the already queued
+                        // FFN-up prefix.  Its synchronous fallback is still safe.
+                        if (!split_backend->iface.cpy_tensor_async ||
+                                !split_backend->iface.cpy_tensor_async(
+                                        input_backend, split_backend, gate_input, gate_input_cpy)) {
+                            ggml_backend_synchronize(input_backend);
+                            ggml_backend_synchronize(split_backend);
+                            ggml_backend_tensor_copy(gate_input, gate_input_cpy);
+                        }
+                    }
+                }
+
+                if (ec == GGML_STATUS_SUCCESS && prefix_end < split->graph.n_nodes) {
+                    struct ggml_cgraph suffix = ggml_graph_view(
+                            &split->graph, prefix_end, split->graph.n_nodes);
+                    ec = ggml_backend_graph_compute_async(split_backend, &suffix);
+                }
+
+                // The complete GPU suffix is now queued.  Prefetch the GPU
+                // rows of the next host gate into the alternate buffer.  The
+                // CUDA copy stream runs beside the current layer and records a
+                // wait behind its already queued work, removing PCIe transfer
+                // from the next gate's critical path.
+                if (ec == GGML_STATUS_SUCCESS && completed_gate_plan != nullptr && completed_gate_slot >= 0) {
+                    for (int future_id = split_id + 1; future_id < sched->n_splits; ++future_id) {
+                        struct ggml_backend_sched_split * future = &splits[future_id];
+                        if (ggml_backend_dev_type(ggml_backend_get_device(sched->backends[future->backend_id])) !=
+                                GGML_BACKEND_DEVICE_TYPE_CPU || future->graph.n_nodes != 1 ||
+                                ggml_backend_sched_op_batch_size(future->graph.nodes[0]) >= 32) {
+                            continue;
+                        }
+                        struct ggml_tensor * future_weight = nullptr;
+                        for (int src_id = 0; src_id < GGML_MAX_SRC; ++src_id) {
+                            struct ggml_tensor * src = future->graph.nodes[0]->src[src_id];
+                            if (src != nullptr && strstr(src->name, ".ffn_gate.weight") != nullptr) {
+                                future_weight = src;
+                                break;
+                            }
+                        }
+                        if (future_weight == nullptr) {
+                            continue;
+                        }
+                        if (future_weight->ne[0] != completed_gate_plan->n_in ||
+                                future_weight->ne[1] != completed_gate_plan->n_out) {
+                            break;
+                        }
+
+                        const int prefetch_slot = 1 - completed_gate_slot;
+                        struct ggml_tensor future_weight_src = *future_weight;
+                        future_weight_src.ne[1] = completed_gate_plan->n_gpu;
+                        future_weight_src.ne[2] = 1;
+                        future_weight_src.ne[3] = 1;
+                        snprintf(future_weight_src.name, sizeof(future_weight_src.name),
+                                "%s.row_split_prefetch", future_weight->name);
+                        ggml_backend_t future_cpu_backend = sched->backends[future->backend_id];
+                        const struct ggml_tensor * future_weight_copy_src = &future_weight_src;
+                        if (const struct ggml_tensor * mirror =
+                                ggml_backend_sched_gate_wc_mirror(
+                                        sched, split_backend, future_weight,
+                                        completed_gate_plan->n_gpu)) {
+                            future_weight_copy_src = mirror;
+                        }
+                        const bool copied_async = split_backend->iface.cpy_tensor_async &&
+                                split_backend->iface.cpy_tensor_async(
+                                        future_cpu_backend, split_backend, future_weight_copy_src,
+                                        completed_gate_plan->weight_gpu[prefetch_slot]);
+                        if (copied_async) {
+                            gate_prefetch.weight = future_weight;
+                            gate_prefetch.n_gpu = completed_gate_plan->n_gpu;
+                            gate_prefetch.slot = prefetch_slot;
+                        }
+                        break;
+                    }
+                }
+
+                ++overlap_pairs;
+                overlap_prefix_nodes += prefix_end;
+                if (cpu_gpu_ffn_overlap_trace && overlap_pairs <= 4) {
+                    fprintf(stderr,
+                            "CPU_GPU_FFN_OVERLAP: pair=%d gate=%s prefix_nodes=%d total_nodes=%d status=%d\n",
+                            overlap_pairs, gate_input->name, prefix_end, split->graph.n_nodes, (int) ec);
+                    fflush(stderr);
+                }
+            } else {
+                ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+                if (decode_gate_weight != nullptr && cpu_gate_ram_mirror) {
+                    decode_gate_weight->data = decode_gate_weight_original_data;
+                }
+            }
+            if (timed_cpu_gate) {
+                cpu_gate_total_us += ggml_time_us() - cpu_gate_begin_us;
+                ++cpu_gate_splits;
+            }
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
@@ -1779,13 +3305,38 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         // record the event of this split
-        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-            ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+        const bool split_is_pending_cpu_gate =
+                pending_cpu_gate != nullptr && pending_cpu_backend_id == split_backend_id &&
+                split->graph.n_nodes == 1 && split->graph.nodes[0] == pending_cpu_gate;
+        if (!split_is_pending_cpu_gate && sched->events[split_backend_id][split->copy_id] != NULL) {
+            ggml_backend_event_record(sched->events[split_backend_id][split->copy_id], split_backend);
+        }
+        if (!split_is_pending_cpu_gate && sched->staging_double_buffer && split->staging_id >= 0 &&
+                sched->staging_events[split_backend_id][split->staging_id] != NULL) {
+            ggml_backend_event_record(sched->staging_events[split_backend_id][split->staging_id], split_backend);
+            sched->staging_event_recorded[split_backend_id][split->staging_id] = true;
         }
 
         prev_backend_id = split_backend_id;
+        prev_copy_id = split->copy_id;
     }
 
+    const enum ggml_status pending_status = wait_pending_cpu_gate();
+    if (pending_status != GGML_STATUS_SUCCESS) {
+        return pending_status;
+    }
+
+    if (cpu_gpu_ffn_overlap_trace && overlap_pairs > 0) {
+        fprintf(stderr, "CPU_GPU_FFN_OVERLAP_SUMMARY: pairs=%d prefix_nodes=%d\n",
+                overlap_pairs, overlap_prefix_nodes);
+        fflush(stderr);
+    }
+
+    if (cpu_gate_timing && cpu_gate_splits > 0) {
+        fprintf(stderr, "CPU_GATE_TIMING: splits=%d total_ms=%.3f\n",
+                cpu_gate_splits, cpu_gate_total_us/1000.0);
+        fflush(stderr);
+    }
     return GGML_STATUS_SUCCESS;
 }
 
@@ -1802,6 +3353,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     struct ggml_backend_sched * sched = (ggml_backend_sched *) calloc(1, sizeof(struct ggml_backend_sched));
 
+    if (getenv("LLAMA_CPU_GPU_FFN_OVERLAP") != NULL ||
+            getenv("LLAMA_CPU_GPU_GATE_ROW_SPLIT") != NULL) {
+        sched->cpu_gpu_overlap = new ggml_backend_sched_cpu_gpu_overlap();
+    }
+
     const char * GGML_SCHED_DEBUG = getenv("GGML_SCHED_DEBUG");
     sched->debug = GGML_SCHED_DEBUG ? atoi(GGML_SCHED_DEBUG) : 0;
 
@@ -1813,7 +3369,28 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
 
     sched->n_backends = n_backends;
+    sched->staging_double_buffer = !parallel && ggml_backend_sched_staging_double_buffer_enabled();
+    sched->staging_slots = 2;
+    if (const char * value = getenv("LLAMA_STAGING_SLOTS")) {
+        sched->staging_slots = std::max(2, std::min(GGML_SCHED_MAX_STAGING_SLOTS, atoi(value)));
+    }
+    // Staging ping-pong is independent from pipeline copies. Reusing copy_id for
+    // per-split staging corrupts ordinary cross-split activation copies.
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
+    memset(sched->staging_buffers, 0, sizeof(sched->staging_buffers));
+    memset(sched->weight_cache_buffers, 0, sizeof(sched->weight_cache_buffers));
+    sched->weight_cache_capacity = 128;
+    sched->weight_cache_entries = (ggml_backend_sched_weight_cache_entry *)
+            calloc(sched->weight_cache_capacity, sizeof(sched->weight_cache_entries[0]));
+    GGML_ASSERT(sched->weight_cache_entries != NULL);
+    sched->gate_ram_mirror_capacity = 128;
+    sched->gate_ram_mirrors = (ggml_backend_sched_gate_ram_mirror_entry *)
+            calloc(sched->gate_ram_mirror_capacity, sizeof(sched->gate_ram_mirrors[0]));
+    GGML_ASSERT(sched->gate_ram_mirrors != NULL);
+    sched->gate_wc_mirror_capacity = 128;
+    sched->gate_wc_mirrors = (ggml_backend_sched_gate_wc_mirror_entry *)
+            calloc(sched->gate_wc_mirror_capacity, sizeof(sched->gate_wc_mirrors[0]));
+    GGML_ASSERT(sched->gate_wc_mirrors != NULL);
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
@@ -1851,6 +3428,12 @@ ggml_backend_sched_t ggml_backend_sched_new(
                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
             }
         }
+        if (sched->staging_double_buffer) {
+            for (int c = 0; c < sched->staging_slots; c++) {
+                sched->staging_events[b][c] = ggml_backend_event_new(backends[b]->device);
+                sched->staging_event_recorded[b][c] = false;
+            }
+        }
     }
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
@@ -1865,9 +3448,42 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
+    delete sched->cpu_gpu_overlap;
+    sched->cpu_gpu_overlap = nullptr;
+    for (int i = 0; i < sched->gate_ram_mirror_n; ++i) {
+        ggml_aligned_free(sched->gate_ram_mirrors[i].data, sched->gate_ram_mirrors[i].size);
+        sched->gate_ram_mirrors[i].data = nullptr;
+    }
+    for (int i = 0; i < sched->gate_wc_mirror_n; ++i) {
+        ggml_backend_buffer_free(sched->gate_wc_mirrors[i].buffer);
+        sched->gate_wc_mirrors[i].buffer = nullptr;
+    }
+    ggml_backend_buffer_free(sched->gate_split_gpu_weight_buffer[0]);
+    ggml_backend_buffer_free(sched->gate_split_gpu_weight_buffer[1]);
+    ggml_backend_buffer_free(sched->gate_split_gpu_output_buffer);
+    ggml_backend_buffer_free(sched->gate_split_cpu_output_buffer);
+    free(sched->gate_split_gpu_output_host);
+    for (int i = 0; i < 32; ++i) {
+        if (sched->gate_split_plans[i] != nullptr) {
+            ggml_free(sched->gate_split_plans[i]->ctx);
+            delete sched->gate_split_plans[i];
+            sched->gate_split_plans[i] = nullptr;
+        }
+    }
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
+        }
+        for (int c = 0; c < sched->staging_slots; c++) {
+            ggml_backend_event_free(sched->staging_events[b][c]);
+            if (sched->staging_buffers[b][c] != NULL) {
+                ggml_backend_buffer_free(sched->staging_buffers[b][c]);
+                sched->staging_buffers[b][c] = NULL;
+            }
+        }
+        if (sched->weight_cache_buffers[b] != NULL) {
+            ggml_backend_buffer_free(sched->weight_cache_buffers[b]);
+            sched->weight_cache_buffers[b] = NULL;
         }
     }
     ggml_gallocr_free(sched->galloc);
@@ -1887,7 +3503,28 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->context_buffer);
     free(sched->graph.nodes);
     free(sched->graph.leafs);
+    free(sched->weight_cache_entries);
+    free(sched->gate_ram_mirrors);
+    free(sched->gate_wc_mirrors);
+    free(sched->weight_cache_alias_shadow);
     free(sched);
+}
+
+bool ggml_backend_sched_share_compute_buffers(ggml_backend_sched_t dst, ggml_backend_sched_t src) {
+    if (dst == nullptr || src == nullptr || dst == src ||
+        dst->n_copies != src->n_copies ||
+        dst->n_backends != src->n_backends || dst->is_alloc) {
+        return false;
+    }
+
+    for (int i = 0; i < dst->n_backends; ++i) {
+        if (dst->bufts[i] != src->bufts[i] ||
+            ggml_backend_get_device(dst->backends[i]) != ggml_backend_get_device(src->backends[i])) {
+            return false;
+        }
+    }
+
+    return ggml_gallocr_share_buffers(dst->galloc, src->galloc);
 }
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
@@ -1900,6 +3537,16 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
         sched->is_reset = true;
     }
     sched->is_alloc = false;
+}
+
+void ggml_backend_sched_request_reset(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+
+    // Sparse page-table changes must happen only after every graph and staging
+    // stream using the arena has completed.
+    ggml_backend_sched_synchronize(sched);
+    ggml_gallocr_request_reset(sched->galloc);
+    ggml_backend_sched_reset(sched);
 }
 
 void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {

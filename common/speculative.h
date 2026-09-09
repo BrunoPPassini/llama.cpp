@@ -64,6 +64,10 @@ struct common_speculative_draft_params {
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
 
+// True when at least one configured speculative implementation consumes the
+// full token history on every draft cycle. Native MTP uses model state instead.
+bool common_speculative_needs_prompt_history(const common_speculative * spec);
+
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
@@ -73,12 +77,22 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 
+// Proposal distributions q used for the most recent draft. Only stochastic
+// draft implementations expose them; nullptr requests exact-match verification.
+const std::vector<std::vector<llama_token_data>> * common_speculative_get_draft_probs(
+        const common_speculative * spec, llama_seq_id seq_id);
+
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
+
+// Reset all per-sequence speculative state at a true sequence boundary.  This
+// is distinct from begin(): begin() may also be called after loading a cached
+// prefix, where the checkpointed boundary state must be preserved.
+void common_speculative_reset(common_speculative * spec, llama_seq_id seq_id);
 
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);

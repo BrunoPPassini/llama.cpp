@@ -4,6 +4,7 @@
 
 #include <cinttypes>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <sstream>
 
@@ -90,6 +91,78 @@ llama_tokens common_ngram_simple_draft(
         }
     }
     if (match_pos == 0) {
+        // A shorter key finds more repetitions, but blindly taking the most
+        // recent continuation creates many bad drafts.  Use it only when at
+        // least two earlier occurrences agree on a substantial continuation.
+        // The target still verifies every token; this only replaces some MTP
+        // calls with a zero-compute history proposal.
+        static const int consensus_min_n = []() {
+            const char * value = std::getenv("LLAMA_NGRAM_SIMPLE_CONSENSUS_MIN_N");
+            if (value == nullptr) {
+                return 0;
+            }
+            char * end = nullptr;
+            const long parsed = std::strtol(value, &end, 10);
+            return end != value && *end == '\0' && parsed >= 2 && parsed <= 1024 ? (int) parsed : 0;
+        }();
+
+        for (int n = (int) n_draft_min - 1; consensus_min_n > 0 && n >= consensus_min_n; --n) {
+            if (cur_len <= (size_t) n + 1) {
+                continue;
+            }
+
+            llama_tokens short_pattern;
+            short_pattern.reserve((size_t) n);
+            for (size_t j = cur_len - (size_t) n + 1; j < cur_len; ++j) {
+                short_pattern.push_back(tokens[j]);
+            }
+            short_pattern.push_back(sampled);
+
+            std::vector<size_t> matches;
+            matches.reserve(4);
+            for (size_t j = cur_len - (size_t) n - 1; j > 0 && matches.size() < 4; --j) {
+                bool match = true;
+                for (size_t k = 0; k < short_pattern.size(); ++k) {
+                    if (tokens[j + k] != short_pattern[k]) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match && cur_len > j + (size_t) n) {
+                    matches.push_back(j);
+                }
+            }
+            if (matches.size() < 2) {
+                continue;
+            }
+
+            size_t prefix = std::min(n_draft_max, cur_len - (matches[0] + (size_t) n));
+            for (size_t h = 1; h < matches.size() && prefix > 0; ++h) {
+                prefix = std::min(prefix, cur_len - (matches[h] + (size_t) n));
+                size_t common = 0;
+                while (common < prefix &&
+                        tokens[matches[0] + (size_t) n + common] ==
+                        tokens[matches[h] + (size_t) n + common]) {
+                    ++common;
+                }
+                prefix = common;
+            }
+
+            // A long agreed prefix amortizes one target verification and is
+            // deliberately stricter than the shortened lookup key.
+            if (prefix < n_draft_min) {
+                continue;
+            }
+
+            draft_tokens.reserve(prefix);
+            for (size_t k = 0; k < prefix; ++k) {
+                draft_tokens.push_back(tokens[matches[0] + (size_t) n + k]);
+            }
+            LOG_DBG("%s: consensus fallback n=%d hits=%zu draft=%zu\n",
+                    __func__, n, matches.size(), prefix);
+            return draft_tokens;
+        }
+
         return draft_tokens;
     }
 

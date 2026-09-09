@@ -4,6 +4,80 @@
 #include "mmvf.cuh"
 #include "convert.cuh"
 
+// src0 is [K, M], src1 is [K, N], and dst is [M, N] in ggml's contiguous
+// row-major storage. The matrix is deliberately narrow in M (48 for the
+// Qwen3.8 recurrent projections) but N ranges from a handful of speculative
+// tokens to the full prefill micro-batch. All operands and accumulation stay
+// in F32.
+template<int TILE>
+static __global__ void mul_mat_thin_f32_tiled(
+        const float * __restrict__ a,
+        const float * __restrict__ b,
+        float * __restrict__ c,
+        int k_size, int m_size, int n_size) {
+    __shared__ float a_tile[TILE][TILE];
+    __shared__ float b_tile[TILE][TILE + 1];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int m  = blockIdx.y*TILE + ty;
+    const int n  = blockIdx.x*TILE + tx;
+
+    float sum = 0.0f;
+    for (int k0 = 0; k0 < k_size; k0 += TILE) {
+        const int k = k0 + tx;
+        a_tile[ty][tx] = (m < m_size && k < k_size) ? a[(int64_t) m*k_size + k] : 0.0f;
+
+        // Global accesses stay contiguous along K. The transposed shared tile
+        // then gives each output token a conflict-free inner-product column.
+        const int b_n = blockIdx.x*TILE + ty;
+        b_tile[tx][ty] = (b_n < n_size && k < k_size) ? b[(int64_t) b_n*k_size + k] : 0.0f;
+        __syncthreads();
+
+        if (m < m_size && n < n_size) {
+#pragma unroll
+            for (int kk = 0; kk < TILE; ++kk) {
+                sum = fmaf(a_tile[ty][kk], b_tile[kk][tx], sum);
+            }
+        }
+        __syncthreads();
+    }
+
+    if (m < m_size && n < n_size) {
+        c[(int64_t) n*m_size + m] = sum;
+    }
+}
+
+void ggml_cuda_mul_mat_thin_f32(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT( dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src0));
+    GGML_ASSERT(ggml_is_contiguous(src1));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(src0->ne[0] == src1->ne[0]);
+    GGML_ASSERT(src0->ne[1] == dst->ne[0]);
+    GGML_ASSERT(src1->ne[1] == dst->ne[1]);
+    GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1);
+    GGML_ASSERT(src1->ne[2] == 1 && src1->ne[3] == 1);
+    GGML_ASSERT( dst->ne[2] == 1 &&  dst->ne[3] == 1);
+
+    constexpr int tile = 16;
+    const int k_size = (int) src0->ne[0];
+    const int m_size = (int) src0->ne[1];
+    const int n_size = (int) src1->ne[1];
+    const dim3 block(tile, tile);
+    const dim3 grid((n_size + tile - 1)/tile, (m_size + tile - 1)/tile);
+    mul_mat_thin_f32_tiled<tile><<<grid, block, 0, ctx.stream()>>>(
+        (const float *) src0->data,
+        (const float *) src1->data,
+        (float *) dst->data,
+        k_size, m_size, n_size);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
 static __global__ void mul_mat_vec_f(
         const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,

@@ -811,7 +811,24 @@ static __global__ void flash_attn_tile(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33) {
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+        const char * K_cold_ptr,
+        const char * V_cold_ptr,
+        const int32_t cold_start,
+        const int32_t nb12_cold,
+        const int32_t nb22_cold,
+        char * ring_vkq_state_ptr,
+        float2 * ring_meta_state_ptr,
+        const int32_t kv_start,
+        const int32_t ne11_total,
+        const bool ring_resume,
+        const bool ring_intermediate) {
+    GGML_UNUSED(ring_vkq_state_ptr);
+    GGML_UNUSED(ring_meta_state_ptr);
+    GGML_UNUSED(kv_start);
+    GGML_UNUSED(ne11_total);
+    GGML_UNUSED(ring_resume);
+    GGML_UNUSED(ring_intermediate);
 #ifdef FLASH_ATTN_AVAILABLE
     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
     const char * GGML_CUDA_RESTRICT K        = K_ptr;
@@ -833,7 +850,8 @@ static __global__ void flash_attn_tile(
                   nb11, nb12, nb13,
                   nb21, nb22, nb23,
                   ne31, ne32, ne33,
-                  nb31, nb32, nb33);
+                  nb31, nb32, nb33,
+            K_cold_ptr, V_cold_ptr, cold_start, nb12_cold, nb22_cold);
         NO_DEVICE_CODE;
         return;
     }
@@ -1140,7 +1158,8 @@ static __global__ void flash_attn_tile(
               nb11, nb12, nb13,
               nb21, nb22, nb23,
               ne31, ne32, ne33,
-              nb31, nb32, nb33);
+              nb31, nb32, nb33,
+        K_cold_ptr, V_cold_ptr, cold_start, nb12_cold, nb22_cold);
     NO_DEVICE_CODE;
 #endif // FLASH_ATTN_AVAILABLE
 }

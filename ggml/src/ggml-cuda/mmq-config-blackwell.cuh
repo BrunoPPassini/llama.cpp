@@ -33,5 +33,36 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
     CASE(GGML_TYPE_NVFP4, 256, 1, 128, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, false);
     CASE(GGML_TYPE_NVFP4, 256, 1, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, false);
 
+    // Optional GB203 tuning is defined only by the corresponding template
+    // instance. Keeping each case local to its translation unit lets us
+    // iterate on dense projection kernels without changing other MMQ types.
+#if defined(GGML_CUDA_Q4_K_BLACKWELL_TUNING)
+    // Smaller GB203 tiles used by the runtime J-selector during prefill
+    // autotuning.  Four warps cover the complete 64-row tile.
+    CASE(GGML_TYPE_Q4_K, 128, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, 256, true, false);
+    CASE(GGML_TYPE_Q4_K, 128, 2, 64,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, 256, true, false);
+    CASE(GGML_TYPE_Q4_K,
+         GGML_CUDA_Q4_K_BLACKWELL_NTHREADS,
+         GGML_CUDA_Q4_K_BLACKWELL_OCCUPANCY,
+         GGML_CUDA_Q4_K_BLACKWELL_I,
+         GGML_CUDA_Q4_K_BLACKWELL_J,
+         GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1,
+         GGML_CUDA_Q4_K_BLACKWELL_K_VRAM,
+         GGML_CUDA_Q4_K_BLACKWELL_STREAM_K,
+         false);
+#endif
+
+#if defined(GGML_CUDA_Q6_K_BLACKWELL_TUNING)
+    CASE(GGML_TYPE_Q6_K,
+         GGML_CUDA_Q6_K_BLACKWELL_NTHREADS,
+         GGML_CUDA_Q6_K_BLACKWELL_OCCUPANCY,
+         GGML_CUDA_Q6_K_BLACKWELL_I,
+         GGML_CUDA_Q6_K_BLACKWELL_J,
+         GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K,
+         GGML_CUDA_Q6_K_BLACKWELL_K_VRAM,
+         GGML_CUDA_Q6_K_BLACKWELL_STREAM_K,
+         false);
+#endif
+
     return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
 }

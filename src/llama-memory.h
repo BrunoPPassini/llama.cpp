@@ -99,6 +99,7 @@ struct llama_memory_i {
 
     // getters
     virtual bool get_can_shift() const = 0;
+    virtual bool get_can_rm_attn() const { return false; }
 
     //
     // ops
@@ -108,6 +109,12 @@ struct llama_memory_i {
     virtual void clear(bool data) = 0;
 
     virtual bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) = 0;
+
+    // Remove only attention-cache entries. Recurrent state is intentionally
+    // left untouched. Memory implementations that cannot separate the two
+    // components return false.
+    virtual bool seq_rm_attn(llama_seq_id, llama_pos, llama_pos) { return false; }
+
     virtual void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
     virtual void seq_keep(llama_seq_id seq_id) = 0;
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
@@ -117,6 +124,10 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
+
+    virtual void set_recurrent_transaction(bool) {}
+    virtual bool recurrent_transaction_deferred() const { return false; }
+    virtual bool recurrent_transaction_accept(llama_seq_id, uint32_t, ggml_backend_t) { return true; }
 
     //
     // state write/read

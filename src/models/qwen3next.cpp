@@ -516,9 +516,13 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn_linear(
     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //v_conv = ggml_cont_4d(ctx0, v_conv, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
 
-    // if head keys and value keys are different, repeat to force tensors into matching shapes
-    // TODO: avoid repeats for fused GDN, needs broadcast configuration for GDN op [TAG_GGML_GDN_BCAST]
-    if (num_k_heads != num_v_heads) {
+    // The fused GDN kernel can map each value head directly to its grouped
+    // Q/K head.  Avoid materializing repeated Q/K tensors on the exact
+    // Qwen3Next/Blackwell path; the fallback graph retains the old layout.
+    const bool fused_gdn_for_batch = n_seq_tokens == 1 ? cparams.fused_gdn_ar : cparams.fused_gdn_ch;
+    const bool direct_gdn_qk_broadcast =
+        getenv("LLAMA_CUDA_QWEN_GDN_QK_BROADCAST") != nullptr && fused_gdn_for_batch;
+    if (num_k_heads != num_v_heads && !direct_gdn_qk_broadcast) {
         GGML_ASSERT(num_v_heads % num_k_heads == 0);
         int64_t repeat_factor = num_v_heads / num_k_heads;
 

@@ -15,6 +15,8 @@
 // TODO: extract the cache state used for graph computation into llama_memory_recurrent_context_i
 //       see the implementation of llama_kv_cache_context_i for an example how to do it
 class llama_memory_recurrent : public llama_memory_i {
+    friend class llama_memory_recurrent_context;
+
 public:
     llama_memory_recurrent(
             const llama_model & model,
@@ -78,6 +80,19 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    bool txn_enabled() const { return use_gdn_txn; }
+    bool txn_phase_arena_enabled() const { return use_gdn_txn && use_phase_arena; }
+    bool txn_lazy_replay_enabled() const { return txn_phase_arena_enabled() && use_lazy_replay; }
+    bool txn_batch_enabled() const { return txn_batch; }
+    void set_recurrent_transaction(bool enabled) override;
+    bool recurrent_transaction_deferred() const override { return txn_phase_arena_enabled(); }
+    bool recurrent_transaction_accept(llama_seq_id seq_id, uint32_t n_keep, ggml_backend_t backend) override;
+    int32_t txn_s_copy(int i, llama_seq_id seq_id) const;
+    int32_t txn_s_work(int i, llama_seq_id seq_id) const;
+    ggml_tensor * get_txn_l(int32_t il) const;
+    ggml_tensor * get_txn_prior_l(int32_t il) const;
+    ggml_tensor * get_txn_verify_l(int32_t il) const;
+
     // computed before each graph build
     uint32_t n = 0;
 
@@ -111,12 +126,31 @@ public:
     // per layer
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;
+    // Optional F16 rollback snapshots for S.  The active S state remains in
+    // s_l as F32 so accepted-token arithmetic is unchanged.
+    std::vector<ggml_tensor *> s_snap_l;
+    bool split_s_snapshots = false;
+
+    std::vector<ggml_tensor *> txn_l;
+    std::vector<ggml_tensor *> txn_prior_l;
+    std::vector<ggml_tensor *> txn_verify_l;
 
 private:
     //const llama_model & model;
     const llama_hparams & hparams;
 
     const uint32_t n_seq_max = 1;
+
+    bool use_gdn_txn = false;
+    bool use_phase_arena = false;
+    bool use_lazy_replay = false;
+    uint32_t txn_lazy_slots = 0;
+    bool txn_batch = false;
+    int32_t txn_verify_layer = -1;
+    std::vector<uint8_t>  txn_active;
+    std::vector<uint32_t> txn_last_tokens;
+    std::vector<uint8_t>  txn_pending;
+    std::vector<uint8_t>  txn_lazy_pending;
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
@@ -127,10 +161,16 @@ private:
     size_t size_s_bytes() const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
-    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
+    void state_write_data(
+            llama_io_write_i & io,
+            const std::vector<std::pair<uint32_t, uint32_t>> & r_ranges,
+            const std::vector<std::pair<uint32_t, uint32_t>> & s_ranges) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
+
+    bool txn_rollback(llama_seq_id seq_id, uint32_t rollback);
+    void txn_commit(const llama_ubatch & ubatch);
 };
 
 class llama_memory_recurrent_context : public llama_memory_context_i {
@@ -168,8 +208,26 @@ public:
     int32_t  get_rs_z() const;
     uint32_t get_size() const;
 
+    // Re-select a prepared microbatch without mutating recurrent metadata.
+    bool select_ubatch(size_t index);
+
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
+    ggml_tensor * get_s_snap_l(int32_t il) const;
+    ggml_tensor * get_txn_l(int32_t il) const;
+    ggml_tensor * get_txn_prior_l(int32_t il) const;
+    ggml_tensor * get_txn_verify_l(int32_t il) const;
+
+    bool has_split_s_snapshots() const;
+    bool txn_enabled() const;
+    bool txn_phase_arena_enabled() const;
+    bool txn_lazy_replay_enabled() const;
+    uint32_t txn_lazy_replay_pending() const;
+    uint32_t txn_lazy_replay_slots() const;
+    bool txn_batch_enabled() const;
+    int32_t txn_s_copy(int i, llama_seq_id seq_id) const;
+    int32_t txn_s_work(int i, llama_seq_id seq_id) const;
+    uint32_t get_n_rs_seq() const;
 
     int32_t s_copy(int i) const;
 
@@ -181,6 +239,24 @@ private:
     size_t i_next = 0;
 
     std::vector<llama_ubatch> ubatches;
+
+    // Graph-visible recurrent metadata is produced by find_slot() for each
+    // microbatch.  The backing memory owns only one mutable view, so a
+    // layer-major scheduler must retain these small descriptors when it later
+    // revisits an earlier microbatch.  State tensors themselves remain shared
+    // and are not copied.
+    struct ubatch_view {
+        bool valid = false;
+        uint32_t n_rs = 0;
+        uint32_t head = 0;
+        int32_t rs_z = -1;
+        std::vector<int32_t> s_copy;
+        std::vector<int32_t> txn_copy;
+        std::vector<int32_t> txn_work;
+        uint32_t txn_lazy_replay = 0;
+    };
+
+    std::vector<ubatch_view> views;
 
     //
     // data needed for building the compute graph for the current ubatch:

@@ -309,8 +309,9 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
         switch (type) { // tuned on RTX 5090
             case GGML_TYPE_Q2_K:
             case GGML_TYPE_Q3_K:
-            case GGML_TYPE_Q4_K:
             case GGML_TYPE_Q5_K:
+                return ne11 <= 5;
+            case GGML_TYPE_Q4_K:
                 return ne11 <= 5;
             case GGML_TYPE_Q6_K:
                 return ne11 <= 7;

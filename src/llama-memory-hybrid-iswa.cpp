@@ -136,8 +136,9 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_update(llama_context * l
 }
 
 bool llama_memory_hybrid_iswa::get_can_shift() const {
-    // Shifting is trivially supported for recurrent
-    return mem_attn->get_can_shift();
+    // See llama_memory_hybrid::get_can_shift(): the recurrent component
+    // cannot represent a historical deletion without checkpoint + replay.
+    return false;
 }
 
 void llama_memory_hybrid_iswa::clear(bool data) {
@@ -190,6 +191,18 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_iswa::memory_br
         mb[buft_size.first] += buft_size.second;
     }
     return mb;
+}
+
+void llama_memory_hybrid_iswa::set_recurrent_transaction(bool enabled) {
+    mem_recr->set_recurrent_transaction(enabled);
+}
+
+bool llama_memory_hybrid_iswa::recurrent_transaction_deferred() const {
+    return mem_recr->recurrent_transaction_deferred();
+}
+
+bool llama_memory_hybrid_iswa::recurrent_transaction_accept(llama_seq_id seq_id, uint32_t n_keep, ggml_backend_t backend) {
+    return mem_recr->recurrent_transaction_accept(seq_id, n_keep, backend);
 }
 
 void llama_memory_hybrid_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {

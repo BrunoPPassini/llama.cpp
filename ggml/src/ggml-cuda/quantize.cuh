@@ -26,6 +26,13 @@ void quantize_mmq_q8_1_cuda(
         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
 
+void quantize_mmq_q8_1_swiglu_cuda(
+        const float * x, const float * g, float * swiglu_dst, void * vy,
+        ggml_type type_src0, int64_t ne00,
+        int64_t x_s01, int64_t x_s02, int64_t x_s03,
+        int64_t g_s01, int64_t g_s02, int64_t g_s03,
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
+
 void quantize_mmq_fp4_cuda(const float *   x,
                              const int32_t * ids,
                              void *          vy,

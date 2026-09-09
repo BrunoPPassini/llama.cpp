@@ -719,11 +719,19 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
     constexpr int threads_per_row = MMQ_ITER_K / (4 * QR4_K);
     constexpr int nrows = warp_size / threads_per_row;
-    const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+    const int txi = threads_per_row == warp_size ? threadIdx.x : threadIdx.x % threads_per_row;
 
 #pragma unroll
     for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
         int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+
+#if defined(GGML_CUDA_Q4_K_BLACKWELL_WARP_SPLIT_3)
+        if constexpr (J == 128 && !fallback) {
+            if (i >= I) {
+                continue;
+            }
+        }
+#endif
 
         if (fallback) {
             i = min(i, i_max);
@@ -751,7 +759,12 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         int i = i0 + threadIdx.y*rows_per_warp + threadIdx.x/2;
         if (i < I) {
 #else
-        int i = (i0 + threadIdx.y*rows_per_warp + threadIdx.x/2) % I;
+        int i;
+        if constexpr (nwarps*rows_per_warp == I) {
+            i = threadIdx.y*rows_per_warp + threadIdx.x/2;
+        } else {
+            i = (i0 + threadIdx.y*rows_per_warp + threadIdx.x/2) % I;
+        }
         {
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
             if (fallback) {
@@ -761,7 +774,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             const block_q4_K * bxi = (const block_q4_K *) x + kbx0 + i*stride;
 
             const int * scales = (const int *) bxi->scales;
-            const int ksc = threadIdx.x % 2;
+            const int ksc = threadIdx.x & 1;
 
             const int sc32 = unpack_scales_q45_K(scales, ksc + 0);
             const int  m32 = unpack_scales_q45_K(scales, ksc + 2);
@@ -967,11 +980,29 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
         const block_q6_K * bxi = (const block_q6_K *) x + kbx0 + i*stride;
 
+#if defined(GGML_CUDA_Q6_K_BLACKWELL_ALIGNED_U32_LOAD) && defined(TURING_MMA_AVAILABLE)
+        // sizeof(block_q6_K) is 210 bytes, so alternating blocks are only
+        // 2-byte aligned.  Use a single 32-bit load for naturally aligned
+        // blocks and retain the safe pair of 16-bit loads for the others.
+        const char * ql_ptr = reinterpret_cast<const char *>(bxi->ql + 4*txi);
+        const int ql = (reinterpret_cast<uintptr_t>(ql_ptr) & 3) == 0
+            ? *reinterpret_cast<const int *>(ql_ptr)
+            : get_int_b2(bxi->ql, txi);
+#else
         const int ql = get_int_b2(bxi->ql, txi);
+#endif
         const int ql0 = (ql >> 0) & 0x0F0F0F0F;
         const int ql1 = (ql >> 4) & 0x0F0F0F0F;
 
-        const int qh = get_int_b2(bxi->qh, (QI6_K/4) * (txi / (QI6_K/2)) + txi % (QI6_K/4));
+        const int qh_idx = (QI6_K/4) * (txi / (QI6_K/2)) + txi % (QI6_K/4);
+#if defined(GGML_CUDA_Q6_K_BLACKWELL_ALIGNED_U32_LOAD) && defined(TURING_MMA_AVAILABLE)
+        const char * qh_ptr = reinterpret_cast<const char *>(bxi->qh + 4*qh_idx);
+        const int qh = (reinterpret_cast<uintptr_t>(qh_ptr) & 3) == 0
+            ? *reinterpret_cast<const int *>(qh_ptr)
+            : get_int_b2(bxi->qh, qh_idx);
+#else
+        const int qh = get_int_b2(bxi->qh, qh_idx);
+#endif
         const int qh0 = ((qh >> ((txi & 0x08) >> 2)) << 4) & 0x30303030;
         const int qh1 =  (qh >> ((txi & 0x08) >> 2))       & 0x30303030;
 

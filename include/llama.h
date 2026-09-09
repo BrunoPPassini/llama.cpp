@@ -742,6 +742,19 @@ extern "C" {
                  llama_pos p0,
                  llama_pos p1);
 
+    // Removes only attention-cache entries in [p0, p1), preserving recurrent
+    // state. Returns false when the memory implementation cannot separate
+    // attention and recurrent components.
+    LLAMA_API bool llama_memory_seq_rm_attn(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos p0,
+                 llama_pos p1);
+
+    // Check whether the memory can remove attention entries independently
+    // from recurrent state.
+    LLAMA_API bool llama_memory_can_rm_attn(llama_memory_t mem);
+
     // Copy all tokens that belong to the specified sequence to another sequence
     // p0 < 0 : [0,  p1]
     // p1 < 0 : [p0, inf)
@@ -981,6 +994,13 @@ extern "C" {
     LLAMA_API int32_t llama_decode(
             struct llama_context * ctx,
               struct llama_batch   batch);
+
+    LLAMA_API void llama_set_recurrent_transaction(struct llama_context * ctx, bool enabled);
+    LLAMA_API bool llama_recurrent_transaction_deferred(const struct llama_context * ctx);
+    LLAMA_API bool llama_recurrent_transaction_accept(
+            struct llama_context * ctx,
+                  llama_seq_id     seq_id,
+                      uint32_t     n_keep);
 
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)

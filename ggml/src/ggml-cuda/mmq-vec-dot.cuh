@@ -251,7 +251,11 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
             tile_B B;
             float dB[tile_C::ne/2];
 
+#if defined(GGML_CUDA_Q4_K_BLACKWELL_B_LDMATRIX)
+            load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
+#else
             load_generic(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K); // faster than load_ldmatrix
+#endif
 
 #pragma unroll
             for (int l = 0; l < tile_C::ne/2; ++l) {
@@ -441,6 +445,199 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 }
+
+#if defined(GGML_CUDA_Q4_K_BLACKWELL_WARP_SPLIT_3)
+// GB203 Q4_K 64x128 tile with three warps per 32-row group. Each warp owns
+// every third 8-column MMA tile. This is the middle point between the regular
+// two-warp mapping (high register pressure) and the four-warp mapping (extra
+// duplicated A loads).
+template <ggml_type type, int J, bool fallback>
+static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q4_K_q8_1_mma_warp_split_3(
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+#if defined(TURING_MMA_AVAILABLE)
+    typedef tile<16, 8, int> tile_A;
+    typedef tile< 8, 8, int> tile_B;
+    typedef tile<16, 8, int> tile_C;
+
+    constexpr int I               = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int sram_stride     = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+    constexpr int rows_per_group  = 32;
+    constexpr int ntx             = rows_per_group/tile_C::I;
+    constexpr int warps_per_group = 3;
+    constexpr int physical_warp   = ggml_cuda_get_physical_warp_size();
+
+    static_assert(I == 64 && J == 128 && !fallback, "Q4_K split-3 is specialized for the 64x128 tile");
+    static_assert(ggml_cuda_mmq_get_nthreads(type, J, fallback) ==
+                      (I/rows_per_group)*warps_per_group*physical_warp,
+                  "Q4_K split-3 thread geometry mismatch");
+
+    const int warp_in_group = threadIdx.y % warps_per_group;
+    const int row_group     = threadIdx.y / warps_per_group;
+    const int i0            = row_group*rows_per_group;
+
+    const int   * x_qs = (const int   *) x;
+    const half2 * x_dm = (const half2 *) x_qs + 2*MMQ_TILE_NE_K;
+    const int   * y_qs = (const int   *) y + 4;
+    const half2 * y_dm = (const half2 *) y;
+
+    tile_A   A[ntx][MMQ_TILE_NE_K/QI8_1];
+    float2 dmA[ntx][tile_C::ne/2][MMQ_TILE_NE_K/QI8_1];
+
+#pragma unroll
+    for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_1) {
+            const int k0 = k00 + k01;
+            load_ldmatrix(A[n][k01/QI8_1],
+                          x_qs + (i0 + n*tile_A::I)*sram_stride + k0,
+                          sram_stride);
+        }
+
+#pragma unroll
+        for (int l = 0; l < tile_C::ne/2; ++l) {
+            const int i = i0 + n*tile_A::I + tile_C::get_i(2*l);
+#pragma unroll
+            for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_1) {
+                const int k0 = k00 + k01;
+                dmA[n][l][k01/QI8_1] = __half22float2(x_dm[i*sram_stride + k0/QI8_1]);
+            }
+        }
+    }
+
+    int jq = 0;
+#pragma unroll
+    for (int jg = warp_in_group; jg < J/tile_C::J; jg += warps_per_group, ++jq) {
+        const int j0 = jg*tile_C::J;
+#pragma unroll
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_1) {
+            tile_B B;
+            float2 dsB[tile_C::ne/2];
+
+            load_generic(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
+#pragma unroll
+            for (int l = 0; l < tile_C::ne/2; ++l) {
+                const int j = j0 + tile_C::get_j(l);
+                dsB[l] = __half22float2(y_dm[j*MMQ_TILE_Y_K + k01/QI8_1]);
+            }
+
+#pragma unroll
+            for (int n = 0; n < ntx; ++n) {
+                tile_C C;
+                mma(C, A[n][k01/QI8_1], B);
+#pragma unroll
+                for (int l = 0; l < tile_C::ne; ++l) {
+                    sum[(jq*ntx + n)*tile_C::ne + l] +=
+                        dmA[n][l/2][k01/QI8_1].x*dsB[l%2].x*C.x[l];
+                    sum[(jq*ntx + n)*tile_C::ne + l] +=
+                        dmA[n][l/2][k01/QI8_1].y*dsB[l%2].y;
+                }
+            }
+        }
+    }
+#else
+    ggml_cuda_mmq_vec_dot_q8_1_q8_1_mma<type, J, fallback>(x, y, sum, k00);
+#endif
+}
+#endif
+
+#if defined(GGML_CUDA_Q4_K_BLACKWELL_WARP_SPLIT_4)
+// GB203 specialization for the Q4_K 64x128 tile.  Four warps cooperate on
+// each 32-row group: two column phases times two interleaved 16-column
+// groups.  This halves each warp's accumulator set while preserving the
+// per-output K accumulation order.
+template <ggml_type type, int J, bool fallback>
+static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q4_K_q8_1_mma_warp_split_4(
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+#if defined(TURING_MMA_AVAILABLE)
+    typedef tile<16, 8, int> tile_A;
+    typedef tile< 8, 8, int> tile_B;
+    typedef tile<16, 8, int> tile_C;
+
+    constexpr int I                = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int sram_stride      = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+    constexpr int rows_per_group   = 32;
+    constexpr int ntx              = rows_per_group/tile_C::I;
+    constexpr int warps_per_group  = 4;
+    constexpr int physical_warp    = ggml_cuda_get_physical_warp_size();
+
+    static_assert(I % rows_per_group == 0, "Q4_K warp split requires complete row groups");
+    static_assert(J % 32 == 0, "Q4_K warp split requires complete column groups");
+    static_assert(ggml_cuda_mmq_get_nthreads(type, J, fallback) ==
+                      (I/rows_per_group)*warps_per_group*physical_warp,
+                  "Q4_K warp split thread geometry mismatch");
+
+    const int warp_in_group = threadIdx.y % warps_per_group;
+    const int row_group     = threadIdx.y / warps_per_group;
+    const int column_minor  = warp_in_group & 1;
+    const int column_major  = warp_in_group >> 1;
+
+    y += column_minor * (tile_C::J*MMQ_TILE_Y_K);
+
+    const int   * x_qs = (const int   *) x;
+    const half2 * x_dm = (const half2 *) x_qs + 2*MMQ_TILE_NE_K;
+    const int   * y_qs = (const int   *) y + 4;
+    const half2 * y_dm = (const half2 *) y;
+
+    const int i0 = row_group*rows_per_group;
+
+    tile_A   A[ntx][MMQ_TILE_NE_K/QI8_1];
+    float2 dmA[ntx][tile_C::ne/2][MMQ_TILE_NE_K/QI8_1];
+
+#pragma unroll
+    for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_1) {
+            const int k0 = k00 + k01;
+            load_ldmatrix(A[n][k01/QI8_1],
+                          x_qs + (i0 + n*tile_A::I)*sram_stride + k0,
+                          sram_stride);
+        }
+
+#pragma unroll
+        for (int l = 0; l < tile_C::ne/2; ++l) {
+            const int i = i0 + n*tile_A::I + tile_C::get_i(2*l);
+#pragma unroll
+            for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_1) {
+                const int k0 = k00 + k01;
+                dmA[n][l][k01/QI8_1] = __half22float2(x_dm[i*sram_stride + k0/QI8_1]);
+            }
+        }
+    }
+
+    int jq = 0;
+#pragma unroll
+    for (int j0 = column_major*2*tile_C::J; j0 < J; j0 += 4*tile_C::J, ++jq) {
+#pragma unroll
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_1) {
+            tile_B B;
+            float2 dsB[tile_C::ne/2];
+
+            load_generic(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
+#pragma unroll
+            for (int l = 0; l < tile_C::ne/2; ++l) {
+                const int j = j0 + tile_C::get_j(l);
+                dsB[l] = __half22float2(y_dm[j*MMQ_TILE_Y_K + k01/QI8_1]);
+            }
+
+#pragma unroll
+            for (int n = 0; n < ntx; ++n) {
+                tile_C C;
+                mma(C, A[n][k01/QI8_1], B);
+#pragma unroll
+                for (int l = 0; l < tile_C::ne; ++l) {
+                    sum[(jq*ntx + n)*tile_C::ne + l] +=
+                        dmA[n][l/2][k01/QI8_1].x*dsB[l%2].x*C.x[l];
+                    sum[(jq*ntx + n)*tile_C::ne + l] +=
+                        dmA[n][l/2][k01/QI8_1].y*dsB[l%2].y;
+                }
+            }
+        }
+    }
+#else
+    ggml_cuda_mmq_vec_dot_q8_1_q8_1_mma<type, J, fallback>(x, y, sum, k00);
+#endif
+}
+#endif
 
 // Used for NVFP4, Q3_K, IQ2_S, and IQ2_XS
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_dp4a(
@@ -1091,7 +1288,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int i0 = (threadIdx.y / ntx) * (ntx*tile_A::I);
 
     tile_A   A[ntx][8];
+#if defined(GGML_CUDA_Q6_K_BLACKWELL_PACKED_SCALE)
+    int    scA_packed[ntx][tile_C::ne/2][2];
+#elif !defined(GGML_CUDA_Q6_K_BLACKWELL_ONDEMAND_SCALE)
     int    scA[ntx][tile_C::ne/2][8];
+#endif
     float   dA[ntx][tile_C::ne/2];
 
 #pragma unroll
@@ -1104,6 +1305,18 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             load_ldmatrix(A[n][k01/4 + 1], x_qs + (i0 + n*tile_A::I)*sram_stride + (k0 + tile_A::J), sram_stride);
         }
 
+#if defined(GGML_CUDA_Q6_K_BLACKWELL_PACKED_SCALE)
+#pragma unroll
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 16) {
+            const int k0 = k00 + k01;
+
+#pragma unroll
+            for (int l = 0; l < tile_C::ne/2; ++l) {
+                const int i = i0 + n*tile_C::I + tile_C::get_i(2*l);
+                scA_packed[n][l][k01/16] = x_sc[i*sram_stride + k0/16];
+            }
+        }
+#elif !defined(GGML_CUDA_Q6_K_BLACKWELL_ONDEMAND_SCALE)
 #pragma unroll
         for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 16) {
             const int k0 = k00 + k01;
@@ -1121,6 +1334,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
                 }
             }
         }
+#endif
 
 #pragma unroll
         for (int l = 0; l < tile_C::ne/2; ++l) {
@@ -1156,10 +1370,39 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
                 mma(C[0], A[n][k01/4 + 0], B[0]);
                 mma(C[1], A[n][k01/4 + 1], B[1]);
 
+#if defined(GGML_CUDA_Q6_K_BLACKWELL_PACKED_SCALE)
+#pragma unroll
+                for (int l = 0; l < tile_C::ne/2; ++l) {
+                    const int sc_packed = scA_packed[n][l][k01/16];
+                    const int ksc = (k01 % 16)/4;
+                    const int sc0 = (sc_packed << (24 - 8*ksc)) >> 24;
+                    const int sc1 = (sc_packed << (16 - 8*ksc)) >> 24;
+
+                    tmp[n][2*l + 0] +=
+                        (C[0].x[2*l + 0]*sc0 + C[1].x[2*l + 0]*sc1)*dB[0];
+                    tmp[n][2*l + 1] +=
+                        (C[0].x[2*l + 1]*sc0 + C[1].x[2*l + 1]*sc1)*dB[1];
+                }
+#elif defined(GGML_CUDA_Q6_K_BLACKWELL_ONDEMAND_SCALE)
+#pragma unroll
+                for (int l = 0; l < tile_C::ne/2; ++l) {
+                    const int i = i0 + n*tile_C::I + tile_C::get_i(2*l);
+                    const volatile int * sc_words = x_sc + i*sram_stride + (k00 + k01)/16;
+                    const int sc_packed = *sc_words;
+                    const int8_t * sc = (const int8_t *) &sc_packed;
+                    const int ksc = (k01 % 16)/4;
+
+                    tmp[n][2*l + 0] +=
+                        (C[0].x[2*l + 0]*sc[ksc + 0] + C[1].x[2*l + 0]*sc[ksc + 1])*dB[0];
+                    tmp[n][2*l + 1] +=
+                        (C[0].x[2*l + 1]*sc[ksc + 0] + C[1].x[2*l + 1]*sc[ksc + 1])*dB[1];
+                }
+#else
 #pragma unroll
                 for (int l = 0; l < tile_C::ne; ++l) {
                     tmp[n][l] += (C[0].x[l]*scA[n][l/2][k01/4 + 0] + C[1].x[l]*scA[n][l/2][k01/4 + 1])*dB[l%2];
                 }
+#endif
             }
         }
 
@@ -1176,6 +1419,146 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     NO_DEVICE_CODE;
 #endif // AMD_MFMA_AVAILABLE || AMD_WMMA_AVAILABLE
 }
+
+#if defined(GGML_CUDA_Q6_K_BLACKWELL_WARP_SPLIT_4)
+// GB203 has only 64 Ki 32-bit registers per SM.  The regular Q6_K kernel uses
+// two warps per 32-row group; every warp therefore accumulates half of J and
+// reaches the architectural 255-register limit.  Use four warps per row group
+// instead.  Each warp computes one quarter of J, halving the live accumulator
+// set while preserving the exact MMA, scale and accumulation operations.
+template <ggml_type type, int J, bool fallback>
+static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q6_K_q8_1_mma_warp_split_4(
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+#if defined(TURING_MMA_AVAILABLE)
+    typedef tile<16, 4, int> tile_A;
+    typedef tile< 8, 4, int> tile_B;
+    typedef tile<16, 8, int> tile_C;
+
+    constexpr int I             = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int sram_stride   = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+    constexpr int rows_per_group = 32;
+    constexpr int ntx            = rows_per_group/tile_C::I;
+    constexpr int warps_per_group = 4;
+
+    static_assert(I % rows_per_group == 0, "warp-split-4 requires complete 32-row groups");
+    static_assert(J % 32 == 0, "warp-split-4 requires complete 32-column groups");
+    static_assert(ggml_cuda_mmq_get_nthreads(type, J, fallback) ==
+                      (I/rows_per_group)*warps_per_group*ggml_cuda_get_physical_warp_size(),
+                  "warp-split-4 requires four warps per 32-row group");
+
+    const int warp_in_group = threadIdx.y % warps_per_group;
+    const int row_group     = threadIdx.y / warps_per_group;
+    const int column_minor  = warp_in_group & 1;
+    const int column_major  = warp_in_group >> 1;
+
+    // The minor phase selects the second 8-column MMA panel.  The major phase
+    // selects alternating 16-column groups in the loop below.
+    y += column_minor * (tile_C::J*MMQ_TILE_Y_K);
+
+    const int   * x_qs = (const int   *) x;
+    const float * x_df = (const float *) x_qs + MMQ_TILE_NE_K*2;
+    const int   * x_sc = (const int   *) x_df + MMQ_TILE_NE_K/QI6_K;
+    const int   * y_qs = (const int   *) y + 4;
+    const float * y_df = (const float *) y;
+
+    const int i0 = row_group * rows_per_group;
+
+    tile_A A[ntx][8];
+#if defined(GGML_CUDA_Q6_K_BLACKWELL_PACKED_SCALE)
+    int  scA_packed[ntx][tile_C::ne/2][2];
+#else
+    int  scA[ntx][tile_C::ne/2][8];
+#endif
+    float dA[ntx][tile_C::ne/2];
+
+#pragma unroll
+    for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 8) {
+            const int k0 = k00 + k01;
+            load_ldmatrix(A[n][k01/4 + 0], x_qs + (i0 + n*tile_A::I)*sram_stride + (k0 + 0),         sram_stride);
+            load_ldmatrix(A[n][k01/4 + 1], x_qs + (i0 + n*tile_A::I)*sram_stride + (k0 + tile_A::J), sram_stride);
+        }
+
+#pragma unroll
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 16) {
+            const int k0 = k00 + k01;
+#pragma unroll
+            for (int l = 0; l < tile_C::ne/2; ++l) {
+                const int i = i0 + n*tile_C::I + tile_C::get_i(2*l);
+#if defined(GGML_CUDA_Q6_K_BLACKWELL_PACKED_SCALE)
+                scA_packed[n][l][k01/16] = x_sc[i*sram_stride + k0/16];
+#else
+                const int sc_packed = x_sc[i*sram_stride + k0/16];
+                const int8_t * sc = (const int8_t *) &sc_packed;
+#pragma unroll
+                for (int ksc = 0; ksc < sizeof(int); ++ksc) {
+                    scA[n][l][k01/4 + ksc] = sc[ksc];
+                }
+#endif
+            }
+        }
+
+#pragma unroll
+        for (int l = 0; l < tile_C::ne/2; ++l) {
+            const int i = i0 + n*tile_C::I + tile_C::get_i(2*l);
+            dA[n][l] = x_df[i*sram_stride];
+        }
+    }
+
+    int jq = 0;
+#pragma unroll
+    for (int j0 = column_major*2*tile_C::J; j0 < J; j0 += 4*tile_C::J, ++jq) {
+        float tmp[ntx][tile_C::ne] = {{0.0f}};
+
+#pragma unroll
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 8) {
+            tile_B B[2];
+            float dB[tile_C::ne/2];
+
+            load_generic(B[0], y_qs + j0*MMQ_TILE_Y_K + 0         + k01, MMQ_TILE_Y_K);
+            load_generic(B[1], y_qs + j0*MMQ_TILE_Y_K + tile_B::J + k01, MMQ_TILE_Y_K);
+
+#pragma unroll
+            for (int l = 0; l < tile_C::ne/2; ++l) {
+                const int j = j0 + tile_C::get_j(l);
+                dB[l] = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
+            }
+
+#pragma unroll
+            for (int n = 0; n < ntx; ++n) {
+                tile_C C[2];
+                mma(C[0], A[n][k01/4 + 0], B[0]);
+                mma(C[1], A[n][k01/4 + 1], B[1]);
+#pragma unroll
+                for (int l = 0; l < tile_C::ne; ++l) {
+#if defined(GGML_CUDA_Q6_K_BLACKWELL_PACKED_SCALE)
+                    const int sc_packed = scA_packed[n][l/2][k01/16];
+                    const int ksc = (k01 % 16)/4;
+                    const int sc0 = (sc_packed << (24 - 8*ksc)) >> 24;
+                    const int sc1 = (sc_packed << (16 - 8*ksc)) >> 24;
+                    tmp[n][l] += (C[0].x[l]*sc0 + C[1].x[l]*sc1)*dB[l%2];
+#else
+                    tmp[n][l] += (C[0].x[l]*scA[n][l/2][k01/4 + 0] +
+                                  C[1].x[l]*scA[n][l/2][k01/4 + 1])*dB[l%2];
+#endif
+                }
+            }
+        }
+
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                sum[(jq*ntx + n)*tile_C::ne + l] += tmp[n][l]*dA[n][l/2];
+            }
+        }
+    }
+#else
+    ggml_cuda_mmq_vec_dot_q6_K_q8_1_mma<type, J, fallback>(x, y, sum, k00);
+#endif
+}
+#endif
 
 // ---------------------------------------------------------------------------------------------
 

@@ -39,7 +39,18 @@ static __global__ void flash_attn_ext_vec(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33) {
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+        const char * K_cold_ptr,
+        const char * V_cold_ptr,
+        const int32_t cold_start,
+        const int32_t nb12_cold,
+        const int32_t nb22_cold,
+        char * ring_vkq_state_ptr,
+        float2 * ring_meta_state_ptr,
+        const int32_t kv_start,
+        const int32_t ne11_total,
+        const bool ring_resume,
+        const bool ring_intermediate) {
     ggml_cuda_pdl_lc();
 #ifdef FLASH_ATTN_AVAILABLE
     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
@@ -50,6 +61,10 @@ static __global__ void flash_attn_ext_vec(
     const int  * GGML_CUDA_RESTRICT KV_max   = KV_max_ptr;
     float      * GGML_CUDA_RESTRICT dst      = dst_ptr;
     float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
+    const char * GGML_CUDA_RESTRICT K_cold   = K_cold_ptr;
+    const char * GGML_CUDA_RESTRICT V_cold   = V_cold_ptr;
+    char       * GGML_CUDA_RESTRICT ring_vkq_state  = ring_vkq_state_ptr;
+    float2     * GGML_CUDA_RESTRICT ring_meta_state = ring_meta_state_ptr;
 
     // Skip unused kernel variants for faster compilation:
     if (use_logit_softcap && !(D == 128 || D == 256)) {
@@ -61,7 +76,8 @@ static __global__ void flash_attn_ext_vec(
                   nb11, nb12, nb13,
                   nb21, nb22, nb23,
                   ne31, ne32, ne33,
-                  nb31, nb32, nb33);
+                  nb31, nb32, nb33,
+            K_cold, V_cold, cold_start, nb12_cold, nb22_cold);
         NO_DEVICE_CODE;
         return;
     }
@@ -109,6 +125,10 @@ static __global__ void flash_attn_ext_vec(
     Q += nb03*sequence + nb02* head              + nb01*ic0;
     K += nb13*sequence + nb12*(head / gqa_ratio);
     V += nb23*sequence + nb22*(head / gqa_ratio);
+    if (K_cold) {
+        K_cold += nb12_cold*(head / gqa_ratio);
+        V_cold += nb22_cold*(head / gqa_ratio);
+    }
 
     const half * maskh  = (const half  *) (mask + nb33*(sequence % ne33) + nb31*ic0);
 
@@ -135,6 +155,33 @@ static __global__ void flash_attn_ext_vec(
     for (int j = 0; j < ncols; ++j) {
         KQ_max[j] = -FLT_MAX/2.0f;
         KQ_sum[j] = 0.0f;
+        if (ring_resume && (ncols == 1 || ic0 + j < int(ne01.z))) {
+            const size_t j_dst = (size_t(sequence)*int(ne01.z) + ic0 + j)*ne02 + head;
+            const size_t i_state = (j_dst*gridDim.y + blockIdx.y)*nthreads + tid;
+            const float2 state = ring_meta_state[i_state];
+            KQ_max[j] = state.x;
+            KQ_sum[j] = state.y;
+        }
+    }
+
+    if (ring_resume) {
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            if (ncols > 1 && ic0 + j >= int(ne01.z)) {
+                break;
+            }
+            const size_t j_dst = (size_t(sequence)*int(ne01.z) + ic0 + j)*ne02 + head;
+            const size_t i_state = (j_dst*gridDim.y + blockIdx.y)*nthreads + tid;
+#ifdef V_DOT2_F32_F16_AVAILABLE
+            const half2 * state = (const half2 *) ring_vkq_state + i_state*((D/2)/nthreads_V);
+#else
+            const float2 * state = (const float2 *) ring_vkq_state + i_state*((D/2)/nthreads_V);
+#endif
+#pragma unroll
+            for (int k = 0; k < (D/2)/nthreads_V; ++k) {
+                VKQ[j][k] = state[k];
+            }
+        }
     }
 
     // Convert Q to float2 (f16 K) or q8_1 (quantized K) and store in registers:
@@ -248,12 +295,21 @@ static __global__ void flash_attn_ext_vec(
     }
 
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
-    K     += blockIdx.y*nthreads * nb11;
-    V     += blockIdx.y*nthreads * nb21;
-    maskh += blockIdx.y*nthreads;
-    for (int k_VKQ_0 = blockIdx.y*nthreads; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nthreads,
+    int partition_start = blockIdx.y*nthreads;
+    if (ring_vkq_state) {
+        const int partition_phase = (kv_start/nthreads) % int(gridDim.y);
+        partition_start = (int(blockIdx.y) - partition_phase + int(gridDim.y)) % int(gridDim.y) * nthreads;
+    }
+    K     += partition_start * nb11;
+    V     += partition_start * nb21;
+    maskh += kv_start + partition_start;
+    for (int k_VKQ_0 = partition_start; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nthreads,
              // Increment pointers after each loop:
              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
+
+        const bool use_cold = K_cold && k_VKQ_0 >= cold_start;
+        const char * K_tile = use_cold ? K_cold + (k_VKQ_0 - cold_start)*nb11 : K;
+        const char * V_tile = use_cold ? V_cold + (k_VKQ_0 - cold_start)*nb21 : V;
 
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]; // KQ in registers.
@@ -270,7 +326,7 @@ static __global__ void flash_attn_ext_vec(
 
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
-                float sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+                float sum = vec_dot_KQ(K_tile + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
                 sum = warp_reduce_sum<nthreads_KQ>(sum);
 
                 if (use_logit_softcap) {
@@ -278,7 +334,7 @@ static __global__ void flash_attn_ext_vec(
                 }
 
                 if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
-                    sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
+                    sum += slope*__half2float(maskh[j*ne11_total + i_KQ]);
                 }
 
                 KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
@@ -317,9 +373,7 @@ static __global__ void flash_attn_ext_vec(
 #endif // V_DOT2_F32_F16_AVAILABLE
         }
 
-#ifndef GGML_USE_HIP
-        __syncwarp();
-#endif // GGML_USE_HIP
+        ggml_cuda_syncwarp();
 
 #pragma unroll
         for (int k0 = 0; k0 < WARP_SIZE; k0 += V_cols_per_iter) {
@@ -336,14 +390,14 @@ static __global__ void flash_attn_ext_vec(
                 half2 tmp[V_rows_per_thread/2];
                 if constexpr (type_V == GGML_TYPE_BF16) {
                     float2 tmp_f[V_rows_per_thread/2];
-                    dequantize_V(V + k*nb21, tmp_f,
+                    dequantize_V(V_tile + k*nb21, tmp_f,
                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
 #pragma unroll
                     for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
                         tmp[i_VKQ_1] = __float22half2_rn(tmp_f[i_VKQ_1]);
                     }
                 } else {
-                    dequantize_V(V + k*nb21, tmp,
+                    dequantize_V(V_tile + k*nb21, tmp,
                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
                 }
 #pragma unroll
@@ -363,7 +417,7 @@ static __global__ void flash_attn_ext_vec(
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
                 float2 tmp[V_rows_per_thread/2];
-                dequantize_V(V + k*nb21, tmp,
+                dequantize_V(V_tile + k*nb21, tmp,
                     2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
 #pragma unroll
                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
@@ -376,6 +430,28 @@ static __global__ void flash_attn_ext_vec(
             }
 #endif // V_DOT2_F32_F16_AVAILABLE
         }
+    }
+
+    if (ring_intermediate) {
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            if (ncols > 1 && ic0 + j >= int(ne01.z)) {
+                break;
+            }
+            const size_t j_dst = (size_t(sequence)*int(ne01.z) + ic0 + j)*ne02 + head;
+            const size_t i_state = (j_dst*gridDim.y + blockIdx.y)*nthreads + tid;
+            ring_meta_state[i_state] = make_float2(KQ_max[j], KQ_sum[j]);
+#ifdef V_DOT2_F32_F16_AVAILABLE
+            half2 * state = (half2 *) ring_vkq_state + i_state*((D/2)/nthreads_V);
+#else
+            float2 * state = (float2 *) ring_vkq_state + i_state*((D/2)/nthreads_V);
+#endif
+#pragma unroll
+            for (int k = 0; k < (D/2)/nthreads_V; ++k) {
+                state[k] = VKQ[j][k];
+            }
+        }
+        return;
     }
 
     if (sinks && blockIdx.y == 0) {
@@ -522,7 +598,9 @@ static __global__ void flash_attn_ext_vec(
               nb11, nb12, nb13,
               nb21, nb22, nb23,
               ne31, ne32, ne33,
-              nb31, nb32, nb33);
+              nb31, nb32, nb33,
+        K_cold_ptr, V_cold_ptr, cold_start, nb12_cold, nb22_cold,
+        ring_vkq_state_ptr, ring_meta_state_ptr, kv_start, ne11_total, ring_resume, ring_intermediate);
     NO_DEVICE_CODE;
 #endif // FLASH_ATTN_AVAILABLE
 }

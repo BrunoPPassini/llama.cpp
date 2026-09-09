@@ -1,5 +1,9 @@
 #include "unary.cuh"
 #include "convert.cuh"
+#include "quantize.cuh"
+
+#include <climits>
+#include <type_traits>
 
 static __device__ __forceinline__ float op_abs(float x) {
     return fabsf(x);
@@ -277,10 +281,64 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, 
 }
 
 template <float (*op)(float), typename T>
+static __global__ void unary_gated_contiguous_kernel(const T * x, const T * g, T * dst, const int64_t k) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+    // Identical arithmetic to unary_gated_op_kernel.  For tightly packed,
+    // separate gate/up tensors j0 == j1 == i, so avoid two 64-bit div/mod
+    // address calculations per element.
+    dst[i] = (T)(op((float)x[i]) * (float)g[i]);
+}
+
+template <float (*op)(float)>
+static __global__ void unary_gated_contiguous_float4_kernel(
+        const float4 * __restrict__ x, const float4 * __restrict__ g,
+        float4 * __restrict__ dst, const int k4) {
+    ggml_cuda_pdl_lc();
+    const int i = int(blockDim.x)*int(blockIdx.x) + int(threadIdx.x);
+
+    if (i >= k4) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+    const float4 xv = x[i];
+    const float4 gv = g[i];
+    float4 out;
+    out.x = op(xv.x) * gv.x;
+    out.y = op(xv.y) * gv.y;
+    out.z = op(xv.z) * gv.z;
+    out.w = op(xv.w) * gv.w;
+    dst[i] = out;
+}
+
+template <float (*op)(float), typename T>
 static void unary_gated_cuda(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, cudaStream_t stream) {
     const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
-    ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T>, launch_params, x, g, dst, k, n, o0, o1);
+    if (o0 == n && o1 == n) {
+        if constexpr (std::is_same_v<T, float>) {
+            if (k % 4 == 0) {
+                GGML_ASSERT(k / 4 <= INT_MAX);
+                const int k4 = int(k / 4);
+                const int num_blocks4 = (k4 + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+                const ggml_cuda_kernel_launch_params launch_params4 =
+                    ggml_cuda_kernel_launch_params((dim3)num_blocks4, CUDA_GLU_BLOCK_SIZE, 0, stream);
+                ggml_cuda_kernel_launch(unary_gated_contiguous_float4_kernel<op>, launch_params4,
+                    (const float4 *) x, (const float4 *) g, (float4 *) dst, k4);
+                return;
+            }
+        }
+        ggml_cuda_kernel_launch(unary_gated_contiguous_kernel<op, T>, launch_params, x, g, dst, k);
+    } else {
+        ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T>, launch_params, x, g, dst, k, n, o0, o1);
+    }
 }
 
 template <float (*op)(float)>
@@ -314,6 +372,7 @@ void ggml_cuda_op_unary_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     const int32_t swapped = ((const int32_t *) dst->op_params)[1];
 
+
     if (src0->type == GGML_TYPE_F16) {
         half * src0_p = (half *) src0_d;
         half * src1_p = (half *) src1_d;
@@ -346,6 +405,92 @@ void ggml_cuda_op_geglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 void ggml_cuda_op_swiglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    static const bool fuse_q8_1 = getenv("LLAMA_CUDA_FUSE_SWIGLU_Q8_1") != nullptr;
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    // Qwen's dense FFN uses split F32 gate/up inputs and feeds this tensor
+    // directly to a Q6_K down projection.  For multi-token prefill, form the
+    // exact MMQ Q8_1 activation here while gate/up are still live, and hand
+    // the stable buffer to the immediately following down projection.
+    // Decode (one row), packed GLU, F16, and every other named GLU are left
+    // untouched.  The consumer additionally pointer-matches dst before use.
+    const char * layer_suffix = strstr(dst->name, "ffn_swiglu-");
+    const int layer = layer_suffix != nullptr ? atoi(layer_suffix + strlen("ffn_swiglu-")) : -1;
+    // Audited directly from Qwen3.8-27B-Q4_K_M.gguf.  Q4_K_M assigns Q6_K
+    // to 33 important down projections and Q4_K to the remaining 32.  Their
+    // MMQ Q8_1 scale/sum layouts differ, so produce the layout of the exact
+    // consumer rather than assuming every ffn_down is Q6_K.
+    const bool q6_down = layer >= 0 && layer <= 64 &&
+        (layer <= 7 || (layer >= 10 && layer <= 52 && (layer - 10) % 3 == 0) || layer >= 55);
+    const ggml_type down_type = q6_down ? GGML_TYPE_Q6_K : GGML_TYPE_Q4_K;
+
+    if (fuse_q8_1 && src1 != nullptr && src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+            ggml_nrows(dst) > 1 && dst->ne[0] == 17408 && layer >= 0 && layer <= 64 &&
+            down_type == GGML_TYPE_Q6_K) {
+        GGML_ASSERT(ggml_is_contiguous_1(src0));
+        GGML_ASSERT(ggml_is_contiguous_1(src1));
+        GGML_ASSERT(ggml_is_contiguous(dst));
+
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        const int64_t ne0_padded = GGML_PAD(dst->ne[0], MATRIX_ROW_PADDING);
+        const size_t logical_bytes_q8_1 = dst->ne[3]*dst->ne[2] * dst->ne[1]*ne0_padded *
+            sizeof(block_q8_1_mmq)/QK8_1_MMQ;
+        const size_t nbytes_q8_1 = logical_bytes_q8_1 +
+            ggml_cuda_mmq_get_J_max(down_type, /*fallback=*/false, cc, dst->ne[1]) *
+            sizeof(block_q8_1_mmq);
+
+        ggml_cuda_mmq_q8_1_cache & cache = ctx.mmq_q8_1_cache[ctx.curr_stream_no];
+        if (cache.capacity < nbytes_q8_1) {
+            void * replacement = nullptr;
+            ggml_cuda_set_device(ctx.device);
+            const size_t allocation_size = ((nbytes_q8_1 + nbytes_q8_1/10 + 255)/256)*256;
+            CUDA_CHECK(cudaMalloc(&replacement, allocation_size));
+            if (cache.data != nullptr) {
+                ctx.mmq_q8_1_retired.push_back(cache.data);
+            }
+            cache.data = replacement;
+            cache.capacity = allocation_size;
+        }
+        cache.valid = false;
+
+        // MMQ over-allocates a small guard row beyond the logical Q8_1
+        // payload.  A persistent buffer retains bytes from the preceding
+        // projection, unlike the ordinary temporary pool allocation.  Keep
+        // only that guard deterministic; the quantizer overwrites the full
+        // logical payload below.
+        CUDA_CHECK(cudaMemsetAsync(
+            (char *) cache.data + logical_bytes_q8_1, 0,
+            nbytes_q8_1 - logical_bytes_q8_1, ctx.stream()));
+
+        quantize_mmq_q8_1_swiglu_cuda(
+            (const float *) src0->data, (const float *) src1->data, (float *) dst->data, cache.data, down_type,
+            dst->ne[0],
+            src0->nb[1] / sizeof(float), src0->nb[2] / sizeof(float), src0->nb[3] / sizeof(float),
+            src1->nb[1] / sizeof(float), src1->nb[2] / sizeof(float), src1->nb[3] / sizeof(float),
+            ne0_padded, dst->ne[1], dst->ne[2], dst->ne[3], ctx.stream());
+        CUDA_CHECK(cudaGetLastError());
+
+        ggml_cuda_swiglu_q8_1_candidate & candidate = ctx.swiglu_q8_1_candidate[ctx.curr_stream_no];
+        candidate.dst_data = dst->data;
+        // Reuse the pointer field as the already-quantized Q8_1 hand-off.  The
+        // original F32 sources need not survive beyond this node.
+        candidate.x = (const float *) cache.data;
+        candidate.g = nullptr;
+        candidate.ne00 = dst->ne[0];
+        candidate.ne01 = dst->ne[1];
+        candidate.ne02 = dst->ne[2];
+        candidate.ne03 = dst->ne[3];
+        candidate.x_s01 = int64_t(down_type);
+        candidate.x_s02 = 0;
+        candidate.x_s03 = 0;
+        candidate.g_s01 = 0;
+        candidate.g_s02 = 0;
+        candidate.g_s03 = 0;
+        candidate.valid = true;
+        return;
+    }
+
     ggml_cuda_op_unary_gated<op_silu>(ctx, dst);
 }
 
@@ -625,6 +770,67 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
         default:
             GGML_ABORT("Unsupported unary op for fused unary+mul");
     }
+}
+
+/* fused Qwen recurrent alpha bias + softplus + scale */
+
+static __global__ void qwen_alpha_gate_f32(
+        const float * alpha,
+        const float * dt_bias,
+        const float * a,
+        float * gate,
+        const int64_t nelements,
+        const int64_t nchannels) {
+    const int64_t i = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
+    if (i >= nelements) {
+        return;
+    }
+
+    const int64_t channel = i % nchannels;
+    const float biased = alpha[i] + dt_bias[channel];
+    gate[i] = op_softplus(biased) * a[channel];
+}
+
+void ggml_cuda_op_qwen_alpha_gate(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * add_node,
+        ggml_tensor * softplus_node,
+        ggml_tensor * mul_node) {
+    const ggml_tensor * alpha   = add_node->src[0];
+    const ggml_tensor * dt_bias = add_node->src[1];
+    const ggml_tensor * a       = mul_node->src[1];
+
+    GGML_ASSERT(softplus_node->src[0] == add_node);
+    GGML_ASSERT(mul_node->src[0] == softplus_node);
+    GGML_ASSERT(alpha->type == GGML_TYPE_F32);
+    GGML_ASSERT(dt_bias->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(mul_node->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(alpha));
+    GGML_ASSERT(ggml_is_contiguous(dt_bias));
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(ggml_is_contiguous(mul_node));
+    GGML_ASSERT(ggml_nelements(dt_bias) == alpha->ne[0]);
+    GGML_ASSERT(ggml_nelements(a) == alpha->ne[0]);
+    GGML_ASSERT(ggml_are_same_shape(alpha, add_node));
+    GGML_ASSERT(ggml_are_same_shape(alpha, softplus_node));
+    GGML_ASSERT(ggml_are_same_shape(alpha, mul_node));
+
+    const int64_t nelements = ggml_nelements(alpha);
+    const int64_t nchannels = alpha->ne[0];
+    constexpr int block_size = 128;
+    const int block_count = (int) ((nelements + block_size - 1) / block_size);
+    cudaStream_t stream = ctx.stream();
+
+    const ggml_cuda_kernel_launch_params launch_params =
+        ggml_cuda_kernel_launch_params(block_count, block_size, 0, stream);
+    ggml_cuda_kernel_launch(qwen_alpha_gate_f32, launch_params,
+        (const float *) alpha->data,
+        (const float *) dt_bias->data,
+        (const float *) a->data,
+        (float *) mul_node->data,
+        nelements,
+        nchannels);
 }
 
 /* fused relu + sqr */

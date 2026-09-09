@@ -59,6 +59,7 @@ endif()
 set(TARGET llama-server)
 
 add_executable(${TARGET} main.cpp)
+set_target_properties(${TARGET} PROPERTIES OUTPUT_NAME "llama-server-mtpctx")
 install(TARGETS ${TARGET} RUNTIME)
 
 target_link_libraries(${TARGET} PRIVATE llama-server-impl)

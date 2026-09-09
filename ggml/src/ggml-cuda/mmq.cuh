@@ -518,6 +518,146 @@ static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
     }
 }
 
+#if defined(GGML_CUDA_Q6_K_BLACKWELL_WARP_SPLIT_4)
+template<ggml_type type, int J, bool fallback>
+static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma_warp_split_4(
+        const float * __restrict__ sum, const int * __restrict__ ids_dst, float * __restrict__ dst,
+        const float * __restrict__ y_scale, const int stride, const int i_max, const int j_max) {
+#if defined(TURING_MMA_AVAILABLE)
+    typedef tile<16, 8, int> tile_C;
+    constexpr int I                = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int rows_per_group   = 32;
+    constexpr int ntx              = rows_per_group/tile_C::I;
+    constexpr int warps_per_group  = 4;
+
+    const int warp_in_group = threadIdx.y % warps_per_group;
+    const int row_group     = threadIdx.y / warps_per_group;
+    const int column_minor  = warp_in_group & 1;
+    const int column_major  = warp_in_group >> 1;
+    const int i0            = row_group*rows_per_group;
+    const bool y_scale_used = y_scale != nullptr;
+
+    int jq = 0;
+#pragma unroll
+    for (int j0 = column_major*2*tile_C::J; j0 < J; j0 += 4*tile_C::J, ++jq) {
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                const int j = j0 + column_minor*tile_C::J + tile_C::get_j(l);
+                if (j > j_max) {
+                    continue;
+                }
+                const int i = i0 + n*tile_C::I + tile_C::get_i(l);
+                if (fallback && i > i_max) {
+                    continue;
+                }
+                if constexpr (type == GGML_TYPE_NVFP4) {
+                    const float value = sum[(jq*ntx + n)*tile_C::ne + l];
+                    dst[ids_dst[j]*stride + i] = y_scale_used ? y_scale[j]*value : value;
+                } else {
+                    dst[ids_dst[j]*stride + i] = sum[(jq*ntx + n)*tile_C::ne + l];
+                    GGML_UNUSED(y_scale_used);
+                }
+            }
+        }
+    }
+    GGML_UNUSED(I);
+#else
+    ggml_cuda_mmq_write_back_mma<type, J, fallback>(sum, ids_dst, dst, y_scale, stride, i_max, j_max);
+#endif
+}
+#endif
+
+#if defined(GGML_CUDA_Q4_K_BLACKWELL_WARP_SPLIT_3)
+template<ggml_type type, int J, bool fallback>
+static __device__ __forceinline__ void ggml_cuda_mmq_write_back_q4_warp_split_3(
+        const float * __restrict__ sum, const int * __restrict__ ids_dst, float * __restrict__ dst,
+        const float * __restrict__ y_scale, const int stride, const int i_max, const int j_max) {
+#if defined(TURING_MMA_AVAILABLE)
+    typedef tile<16, 8, int> tile_C;
+    constexpr int rows_per_group  = 32;
+    constexpr int ntx             = rows_per_group/tile_C::I;
+    constexpr int warps_per_group = 3;
+
+    const int warp_in_group = threadIdx.y % warps_per_group;
+    const int row_group     = threadIdx.y / warps_per_group;
+    const int i0            = row_group*rows_per_group;
+
+    int jq = 0;
+#pragma unroll
+    for (int jg = warp_in_group; jg < J/tile_C::J; jg += warps_per_group, ++jq) {
+        const int j0 = jg*tile_C::J;
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                const int j = j0 + tile_C::get_j(l);
+                if (j > j_max) {
+                    continue;
+                }
+                const int i = i0 + n*tile_C::I + tile_C::get_i(l);
+                if (fallback && i > i_max) {
+                    continue;
+                }
+                dst[ids_dst[j]*stride + i] = sum[(jq*ntx + n)*tile_C::ne + l];
+            }
+        }
+    }
+    GGML_UNUSED(y_scale);
+#else
+    ggml_cuda_mmq_write_back_mma<type, J, fallback>(
+        sum, ids_dst, dst, y_scale, stride, i_max, j_max);
+#endif
+}
+#endif
+
+#if defined(GGML_CUDA_Q4_K_BLACKWELL_WARP_SPLIT_4)
+template<ggml_type type, int J, bool fallback>
+static __device__ __forceinline__ void ggml_cuda_mmq_write_back_q4_warp_split_4(
+        const float * __restrict__ sum, const int * __restrict__ ids_dst, float * __restrict__ dst,
+        const float * __restrict__ y_scale, const int stride, const int i_max, const int j_max) {
+#if defined(TURING_MMA_AVAILABLE)
+    typedef tile<16, 8, int> tile_C;
+    constexpr int I                = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int rows_per_group   = 32;
+    constexpr int ntx              = rows_per_group/tile_C::I;
+    constexpr int warps_per_group  = 4;
+
+    const int warp_in_group = threadIdx.y % warps_per_group;
+    const int row_group     = threadIdx.y / warps_per_group;
+    const int column_minor  = warp_in_group & 1;
+    const int column_major  = warp_in_group >> 1;
+    const int i0            = row_group*rows_per_group;
+
+    int jq = 0;
+#pragma unroll
+    for (int j0 = column_major*2*tile_C::J; j0 < J; j0 += 4*tile_C::J, ++jq) {
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                const int j = j0 + column_minor*tile_C::J + tile_C::get_j(l);
+                if (j > j_max) {
+                    continue;
+                }
+                const int i = i0 + n*tile_C::I + tile_C::get_i(l);
+                if (fallback && i > i_max) {
+                    continue;
+                }
+                dst[ids_dst[j]*stride + i] = sum[(jq*ntx + n)*tile_C::ne + l];
+            }
+        }
+    }
+    GGML_UNUSED(I);
+    GGML_UNUSED(y_scale);
+#else
+    ggml_cuda_mmq_write_back_mma<type, J, fallback>(
+        sum, ids_dst, dst, y_scale, stride, i_max, j_max);
+#endif
+}
+#endif
+
 // -------------------------------------------------------------------------------------------------------------------------------------
 
 // TODO remove this struct and use ggml_cuda_mmq_sram_layout instead.
@@ -758,6 +898,24 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                 ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma<type, J, fallback>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback>);
         case GGML_TYPE_Q4_K:
+#if defined(GGML_CUDA_Q4_K_BLACKWELL_WARP_SPLIT_3)
+            if constexpr (J == 128 && !fallback) {
+                return ggml_cuda_mmq_util_funcs(
+                    -1,
+                    ggml_cuda_mmq_load_tiles_q4_K<type, J, fallback>,
+                    ggml_cuda_mmq_vec_dot_q4_K_q8_1_mma_warp_split_3<type, J, fallback>,
+                    ggml_cuda_mmq_write_back_q4_warp_split_3<type, J, fallback>);
+            }
+#endif
+#if defined(GGML_CUDA_Q4_K_BLACKWELL_WARP_SPLIT_4)
+            if constexpr (J == 128 && !fallback) {
+                return ggml_cuda_mmq_util_funcs(
+                    -1,
+                    ggml_cuda_mmq_load_tiles_q4_K<type, J, fallback>,
+                    ggml_cuda_mmq_vec_dot_q4_K_q8_1_mma_warp_split_4<type, J, fallback>,
+                    ggml_cuda_mmq_write_back_q4_warp_split_4<type, J, fallback>);
+            }
+#endif
             return ggml_cuda_mmq_util_funcs(
                 -1,
                 ggml_cuda_mmq_load_tiles_q4_K<type, J, fallback>,
@@ -770,6 +928,15 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                 ggml_cuda_mmq_vec_dot_q8_1_q8_1_mma<type, J, fallback>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback>);
         case GGML_TYPE_Q6_K:
+#if defined(GGML_CUDA_Q6_K_BLACKWELL_WARP_SPLIT_4)
+            if constexpr (J == 128 && !fallback) {
+                return ggml_cuda_mmq_util_funcs(
+                    -1,
+                    ggml_cuda_mmq_load_tiles_q6_K<type, J, fallback>,
+                    ggml_cuda_mmq_vec_dot_q6_K_q8_1_mma_warp_split_4<type, J, fallback>,
+                    ggml_cuda_mmq_write_back_mma_warp_split_4<type, J, fallback>);
+            }
+#endif
             return ggml_cuda_mmq_util_funcs(
                 -1,
                 ggml_cuda_mmq_load_tiles_q6_K<type, J, fallback>,
@@ -894,11 +1061,24 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr int ITER_K          = ggml_cuda_mmq_get_K_vram(type, J, fallback);
     constexpr int blocks_per_iter = ITER_K / qk;
 
+#if defined(GGML_CUDA_Q4_K_BLACKWELL_WARP_SPLIT_3)
+    constexpr int sum_ne = J == 128 && !fallback ? 48 : J*I / (nwarps*warp_size);
+    float sum[sum_ne] = {0.0f};
+#else
     float sum[J*I / (nwarps*warp_size)] = {0.0f};
+#endif
 
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
-    for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+#if defined(GGML_CUDA_Q4_K_BLACKWELL_PROCESS_ALL_BLOCKS)
+    // K_vram may group multiple physical Q4_K blocks into one Stream-K
+    // partition.  The shared-memory tile still holds one physical block, so
+    // visit every block in the group rather than skipping the second one.
+    constexpr int blocks_per_compute_step = 1;
+#else
+    constexpr int blocks_per_compute_step = blocks_per_iter;
+#endif
+    for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_compute_step) {
         load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
         {
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
@@ -910,7 +1090,47 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
             }
         }
 
+#if defined(GGML_CUDA_Q4_K_BLACKWELL_PREFETCH_L2)
+        // GB203 can issue the global-memory request for the next packed Q4_K
+        // row while tensor cores consume the current shared-memory tile. Two
+        // lanes cover both cache lines touched by the packed 144-byte block;
+        // this is only a cache hint.
+        if constexpr (type == GGML_TYPE_Q4_K) {
+            if (kb0 + 1 < kb0_stop) {
+                const int linear_thread = threadIdx.y*warp_size + threadIdx.x;
+                const int row = linear_thread / 2;
+                if (row < I) {
+                    const int source_row = fallback ? min(row, tile_x_max_i) : row;
+                    const block_q4_K * next_block = (const block_q4_K *) x +
+                        offset_x + kb0 + 1 + source_row*stride_row_x;
+                    const char * prefetch_ptr = (const char *) next_block + 128*(linear_thread & 1);
+                    asm volatile("prefetch.global.L1 [%0];" :: "l"(prefetch_ptr));
+                }
+            }
+        }
+#endif
+
         __syncthreads();
+
+#if defined(GGML_CUDA_Q6_K_BLACKWELL_PREFETCH_L2)
+        // GB203: the packed Q6_K block for the next K iteration is disjoint
+        // from the current tensor-core work. Pull its two cache-line regions
+        // into L2 while MMA consumes the already-expanded shared-memory tile.
+        // This is a cache hint only; values and arithmetic are unchanged.
+        if constexpr (type == GGML_TYPE_Q6_K) {
+            if (kb0 + blocks_per_iter < kb0_stop) {
+                const int linear_thread = threadIdx.y*warp_size + threadIdx.x;
+                const int row = linear_thread / 2;
+                if (row < I) {
+                    const int source_row = fallback ? min(row, tile_x_max_i) : row;
+                    const block_q6_K * next_block = (const block_q6_K *) x +
+                        offset_x + kb0 + blocks_per_iter + source_row*stride_row_x;
+                    const char * prefetch_ptr = (const char *) next_block + 128*(linear_thread & 1);
+                    asm volatile("prefetch.global.L2 [%0];" :: "l"(prefetch_ptr));
+                }
+            }
+        }
+#endif
 
         vec_dot(tile_x, tile_y, sum, 0);
 
@@ -943,7 +1163,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
-template <ggml_type type, int J, bool fallback>
+template <ggml_type type, int J, bool fallback, bool simple_layout = false>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback), ggml_cuda_mmq_get_occupancy(type, J, fallback))
 static __global__ void mul_mat_q(
         const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
@@ -1055,6 +1275,9 @@ static __global__ void mul_mat_q(
 
     constexpr int ITER_K          = ggml_cuda_mmq_get_K_vram(type, J, fallback);
     constexpr int blocks_per_iter = ITER_K / qk;
+    static_assert(!simple_layout || type == GGML_TYPE_Q4_K,
+        "the dense simple layout specialization is only valid for Q4_K");
+    constexpr bool simple_q4_layout = simple_layout;
 
     // kbc == k block continuous, current index in continuous ijk space.
     int kbc      = int64_t(blockIdx.x)    *(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / gridDim.x;
@@ -1066,24 +1289,45 @@ static __global__ void mul_mat_q(
     // kb0 == k index when doing the matrix multiplication for an output tile.
     int kb0_start = fastmodulo(kbc, blocks_per_ne00);
     int kb0_stop  = min(blocks_per_ne00.z, uint32_t(kb0_start + kbc_stop - kbc));
+    int simple_jt = 0;
+    int simple_it = 0;
+    if constexpr (simple_layout) {
+        const int simple_tile = fastdiv(kbc, blocks_per_ne00);
+        const uint2 simple_pos = fast_div_modulo(simple_tile, ntx);
+        simple_jt = simple_pos.y;
+        simple_it = simple_pos.x;
+    }
     while (kbc < kbc_stop && kb0_stop == int(blocks_per_ne00.z)) {
-        int tmp = fastdiv(kbc, blocks_per_ne00);
-        uint2 tmp2 = fast_div_modulo(tmp, ntx);
-        const int jt = tmp2.y;
-        tmp = tmp2.x;
-        tmp2 = fast_div_modulo(tmp, nchannels_y);
-        const int zt = tmp2.y;
-        tmp = tmp2.x;
-        tmp2 = fast_div_modulo(tmp, nsamples_y);
-        const int wt = tmp2.y;
-        const int it = tmp2.x;
+        int tmp = 0;
+        uint2 tmp2 = {};
+        int jt;
+        int zt;
+        int wt;
+        int it;
+        if constexpr (simple_layout) {
+            jt = simple_jt;
+            zt = 0;
+            wt = 0;
+            it = simple_it;
+        } else {
+            tmp = fastdiv(kbc, blocks_per_ne00);
+            tmp2 = fast_div_modulo(tmp, ntx);
+            jt = tmp2.y;
+            tmp = tmp2.x;
+            tmp2 = fast_div_modulo(tmp, nchannels_y);
+            zt = tmp2.y;
+            tmp = tmp2.x;
+            tmp2 = fast_div_modulo(tmp, nsamples_y);
+            wt = tmp2.y;
+            it = tmp2.x;
+        }
 
         // Defaults for regular matrix multiplication:
         int col_low    = 0;
         int col_high   = ncols_dst;
         int col_diff   = ncols_dst;
-        int offset_y       = wt*stride_sample_y   + zt*stride_channel_y;
-        int offset_dst     = wt*stride_sample_dst + zt*stride_channel_dst + jt*J*stride_col_dst;
+        int offset_y       = simple_q4_layout ? 0 : wt*stride_sample_y + zt*stride_channel_y;
+        int offset_dst     = (simple_q4_layout ? 0 : wt*stride_sample_dst + zt*stride_channel_dst) + jt*J*stride_col_dst;
         int offset_y_scale;
         if constexpr (type == GGML_TYPE_NVFP4) {
             offset_y_scale = wt*nchannels_y.z*ncols_y + zt*ncols_y;
@@ -1091,7 +1335,8 @@ static __global__ void mul_mat_q(
             GGML_UNUSED(offset_y_scale);
         }
 
-        if (ids_dst) {
+        if constexpr (!simple_layout) {
+          if (ids_dst) {
             col_low  = expert_bounds[zt + 0];
             col_high = expert_bounds[zt + 1];
             col_diff = col_high - col_low;
@@ -1124,6 +1369,7 @@ static __global__ void mul_mat_q(
                 ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
             }
             __syncthreads();
+          }
         }
 
         offset_y += (col_low + jt * J) * (sizeof(block_q8_1_mmq) / sizeof(int));
@@ -1137,7 +1383,9 @@ static __global__ void mul_mat_q(
         const int tile_x_max_i = nrows_x  - it*I - 1;
         const int tile_y_max_j = col_diff - jt*J - 1;
 
-        const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
+        const int offset_x = (simple_q4_layout ? 0 :
+            fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x) +
+            it*I*stride_row_x;
 
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         mul_mat_q_process_tile<type, J, fallback, fixup>
@@ -1147,6 +1395,12 @@ static __global__ void mul_mat_q(
 
         kbc += blocks_per_ne00.z;
         kbc -= fastmodulo(kbc, blocks_per_ne00);
+        if constexpr (simple_layout) {
+            if (++simple_jt == int(ntx.z)) {
+                simple_jt = 0;
+                ++simple_it;
+            }
+        }
 
         kb0_start = 0;
         kb0_stop  = min(blocks_per_ne00.z, uint32_t(kbc_stop - kbc));
@@ -1156,23 +1410,36 @@ static __global__ void mul_mat_q(
         return;
     }
 
-    int tmp = fastdiv(kbc, blocks_per_ne00);
-    uint2 tmp2 = fast_div_modulo(tmp, ntx);
-    const int jt = tmp2.y;
-    tmp = tmp2.x;
-    tmp2 = fast_div_modulo(tmp, nchannels_y);
-    const int zt = tmp2.y;
-    tmp = tmp2.x;
-    tmp2 = fast_div_modulo(tmp, nsamples_y);
-    const int wt = tmp2.y;
-    const int it = tmp2.x;
+    int tmp = 0;
+    uint2 tmp2 = {};
+    int jt;
+    int zt;
+    int wt;
+    int it;
+    if constexpr (simple_layout) {
+        jt = simple_jt;
+        zt = 0;
+        wt = 0;
+        it = simple_it;
+    } else {
+        tmp = fastdiv(kbc, blocks_per_ne00);
+        tmp2 = fast_div_modulo(tmp, ntx);
+        jt = tmp2.y;
+        tmp = tmp2.x;
+        tmp2 = fast_div_modulo(tmp, nchannels_y);
+        zt = tmp2.y;
+        tmp = tmp2.x;
+        tmp2 = fast_div_modulo(tmp, nsamples_y);
+        wt = tmp2.y;
+        it = tmp2.x;
+    }
 
     // Defaults for regular matrix multiplication:
     int col_low    = 0;
     int col_high   = ncols_dst;
     int col_diff   = ncols_dst;
-    int offset_y       = wt*stride_sample_y   + zt*stride_channel_y;
-    int offset_dst     = wt*stride_sample_dst + zt*stride_channel_dst + jt*J*stride_col_dst;
+    int offset_y       = simple_q4_layout ? 0 : wt*stride_sample_y + zt*stride_channel_y;
+    int offset_dst     = (simple_q4_layout ? 0 : wt*stride_sample_dst + zt*stride_channel_dst) + jt*J*stride_col_dst;
     int offset_y_scale;
     if constexpr (type == GGML_TYPE_NVFP4) {
         offset_y_scale = wt*nchannels_y.z*ncols_y + zt*ncols_y;
@@ -1180,7 +1447,8 @@ static __global__ void mul_mat_q(
         GGML_UNUSED(offset_y_scale);
     }
 
-    if (ids_dst) {
+    if constexpr (!simple_layout) {
+      if (ids_dst) {
         col_low  = expert_bounds[zt + 0];
         col_high = expert_bounds[zt + 1];
         col_diff = col_high - col_low;
@@ -1208,6 +1476,7 @@ static __global__ void mul_mat_q(
             ids_dst_shared[j] = j;
         }
         __syncthreads();
+      }
     }
 
     offset_y += (col_low + jt * J) * (sizeof(block_q8_1_mmq) / sizeof(int));
@@ -1221,7 +1490,9 @@ static __global__ void mul_mat_q(
     const int tile_x_max_i = nrows_x  - it*I - 1;
     const int tile_y_max_j = col_diff - jt*J - 1;
 
-    const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
+    const int offset_x = (simple_q4_layout ? 0 :
+        fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x) +
+        it*I*stride_row_x;
 
     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     mul_mat_q_process_tile<type, J, fallback, fixup>
@@ -1396,10 +1667,142 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int nwarps = config.nthreads / warp_size;
     const int nbytes_shared = mmq_get_nbytes_shared(config, cc);
 
+#if defined(GGML_CUDA_Q4_K_BLACKWELL_TUNING)
+    bool q4_l2_policy_active = false;
+    cudaStreamAttrValue q4_l2_attr{};
+    if constexpr (type == GGML_TYPE_Q4_K) {
+        static const bool q4_l2_requested = std::getenv("LLAMA_MMQ_Q4_L2_PERSIST") != nullptr;
+        if (q4_l2_requested && args.ncols_dst >= 128) {
+            struct q4_l2_caps {
+                size_t max_window;
+                bool ready;
+            };
+            static const q4_l2_caps caps = [id]() {
+                cudaDeviceProp prop{};
+                if (cudaGetDeviceProperties(&prop, id) != cudaSuccess || prop.persistingL2CacheMaxSize == 0) {
+                    return q4_l2_caps{0, false};
+                }
+                size_t set_aside = 12u * 1024u * 1024u;
+                if (const char * value = std::getenv("LLAMA_MMQ_Q4_L2_SETASIDE_MIB")) {
+                    char * end = nullptr;
+                    const long requested_mib = std::strtol(value, &end, 10);
+                    if (end != value && *end == '\0' && requested_mib > 0) {
+                        set_aside = size_t(requested_mib) * 1024u * 1024u;
+                    }
+                }
+                set_aside = std::min(set_aside, size_t(prop.persistingL2CacheMaxSize));
+                const bool ready = cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, set_aside) == cudaSuccess;
+                return q4_l2_caps{size_t(prop.accessPolicyMaxWindowSize), ready};
+            }();
+
+            if (caps.ready) {
+                const size_t y_nbytes = size_t(args.ncols_y) *
+                    size_t(args.ncols_x / QK8_1_MMQ) * sizeof(block_q8_1_mmq);
+                q4_l2_attr.accessPolicyWindow.base_ptr = const_cast<int *>(args.y);
+                q4_l2_attr.accessPolicyWindow.num_bytes = std::min(y_nbytes, caps.max_window);
+                q4_l2_attr.accessPolicyWindow.hitRatio = 1.0f;
+                q4_l2_attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+                q4_l2_attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+                CUDA_CHECK(cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &q4_l2_attr));
+                q4_l2_policy_active = true;
+
+                if (std::getenv("LLAMA_MMQ_Q4_L2_TRACE") != nullptr) {
+                    static bool traced = false;
+                    if (!traced) {
+                        traced = true;
+                        fprintf(stderr, "MMQ_Q4_L2: y_bytes=%zu window_bytes=%zu\n",
+                                y_nbytes, q4_l2_attr.accessPolicyWindow.num_bytes);
+                        fflush(stderr);
+                    }
+                }
+            }
+        }
+    }
+    const auto reset_q4_l2_policy = [&]() {
+        if (q4_l2_policy_active) {
+            q4_l2_attr.accessPolicyWindow.num_bytes = 0;
+            CUDA_CHECK(cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &q4_l2_attr));
+        }
+    };
+#endif
+
+#if defined(GGML_CUDA_Q6_K_BLACKWELL_TUNING)
+    // The quantized activation matrix is reused by every output-row tile,
+    // while the much larger Q6_K weights are streamed only once.  On GB203
+    // keep that ~10 MiB hot set in the persisting portion of L2 so streaming
+    // weights do not evict it.  This is a cache-retention hint only; values and
+    // arithmetic are unchanged.
+    bool q6_l2_policy_active = false;
+    cudaStreamAttrValue q6_l2_attr{};
+    if constexpr (type == GGML_TYPE_Q6_K) {
+        static const bool q6_l2_requested = std::getenv("LLAMA_MMQ_Q6_L2_PERSIST") != nullptr;
+        if (q6_l2_requested && args.ncols_dst >= 128) {
+            struct q6_l2_caps {
+                size_t max_window;
+                bool ready;
+            };
+            static const q6_l2_caps caps = [id]() {
+                cudaDeviceProp prop{};
+                if (cudaGetDeviceProperties(&prop, id) != cudaSuccess || prop.persistingL2CacheMaxSize == 0) {
+                    return q6_l2_caps{0, false};
+                }
+
+                size_t set_aside = 12u * 1024u * 1024u;
+                if (const char * value = std::getenv("LLAMA_MMQ_Q6_L2_SETASIDE_MIB")) {
+                    char * end = nullptr;
+                    const long requested_mib = std::strtol(value, &end, 10);
+                    if (end != value && *end == '\0' && requested_mib > 0) {
+                        set_aside = size_t(requested_mib) * 1024u * 1024u;
+                    }
+                }
+                set_aside = std::min(set_aside, size_t(prop.persistingL2CacheMaxSize));
+                const bool ready = cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, set_aside) == cudaSuccess;
+                return q6_l2_caps{size_t(prop.accessPolicyMaxWindowSize), ready};
+            }();
+
+            if (caps.ready) {
+                // `args.y` is the Q8_1 activation matrix. Every output-row tile
+                // reuses it, whereas `args.x` is the much larger Q6_K weight
+                // matrix and is streamed only once. Persisting x polluted L2
+                // with cold weight lines; keep the genuinely hot y working set.
+                const size_t y_nbytes = size_t(args.ncols_y) *
+                    size_t(args.ncols_x / QK8_1_MMQ) * sizeof(block_q8_1_mmq);
+                q6_l2_attr.accessPolicyWindow.base_ptr = const_cast<int *>(args.y);
+                q6_l2_attr.accessPolicyWindow.num_bytes = std::min(y_nbytes, caps.max_window);
+                q6_l2_attr.accessPolicyWindow.hitRatio = 1.0f;
+                q6_l2_attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+                q6_l2_attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+                CUDA_CHECK(cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &q6_l2_attr));
+                q6_l2_policy_active = true;
+
+                if (std::getenv("LLAMA_MMQ_Q6_L2_TRACE") != nullptr) {
+                    static bool traced = false;
+                    if (!traced) {
+                        traced = true;
+                        fprintf(stderr, "MMQ_Q6_L2: y_bytes=%zu window_bytes=%zu\n",
+                                y_nbytes, q6_l2_attr.accessPolicyWindow.num_bytes);
+                        fflush(stderr);
+                    }
+                }
+            }
+        }
+    }
+    const auto reset_q6_l2_policy = [&]() {
+        if (q6_l2_policy_active) {
+            q6_l2_attr.accessPolicyWindow.num_bytes = 0;
+            CUDA_CHECK(cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &q6_l2_attr));
+        }
+    };
+#endif
+
     const dim3 block_dims(warp_size, nwarps, 1);
 
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false>), nbytes_shared);
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false, false>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true, false>), nbytes_shared);
+    if constexpr (type == GGML_TYPE_Q4_K) {
+        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false, true>), nbytes_shared);
+        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true, true>), nbytes_shared);
+    }
 
     const int nty  = (args.nrows_x   + config.I - 1) / config.I;
     const int ntx  = (args.ncols_max + config.J - 1) / config.J;
@@ -1418,13 +1821,23 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
-    if (!ggml_cuda_mmq_get_stream_k(type, J, fallback, cc)) {
-        mul_mat_q<type, J, fallback><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
+    // Server-side tuning flags are immutable for the lifetime of llama-server.
+    // getenv() takes the CRT environment lock on Windows, so doing it for every
+    // projection launch adds measurable CPU launch overhead during prefill.
+    static const bool disable_stream_k = std::getenv("LLAMA_MMQ_DISABLE_STREAM_K") != nullptr;
+    if (disable_stream_k || !ggml_cuda_mmq_get_stream_k(type, J, fallback, cc)) {
+        mul_mat_q<type, J, fallback, false><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
              ntx_fd);
+#if defined(GGML_CUDA_Q6_K_BLACKWELL_TUNING)
+        reset_q6_l2_policy();
+#endif
+#if defined(GGML_CUDA_Q4_K_BLACKWELL_TUNING)
+        reset_q4_l2_policy();
+#endif
         return;
     }
 
@@ -1433,7 +1846,24 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int ntiles_dst = ntx * nty * ntzw;
     const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
     const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
-    const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : nsm, 1, 1);
+    unsigned int nblocks_stream_k = GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : nsm;
+#if defined(GGML_CUDA_Q4_K_BLACKWELL_TUNING)
+    if constexpr (type == GGML_TYPE_Q4_K) {
+        static const long blocks_per_sm = []() {
+            const char * value = std::getenv("LLAMA_MMQ_Q4_STREAMK_BLOCKS_PER_SM");
+            if (value == nullptr) {
+                return 0L;
+            }
+            char * end = nullptr;
+            const long parsed = std::strtol(value, &end, 10);
+            return end != value && *end == '\0' && parsed >= 1 && parsed <= 4 ? parsed : 0L;
+        }();
+        if (blocks_per_sm != 0) {
+            nblocks_stream_k = std::min<unsigned int>(ntiles_dst, nsm * blocks_per_sm);
+        }
+    }
+#endif
+    const dim3 block_nums_stream_k(nblocks_stream_k, 1, 1);
 
     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
 
@@ -1448,14 +1878,54 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const dim3 block_nums_fixup(block_nums_stream_k.x, config.I/warp_size, 1);
     const dim3 block_dims_fixup(block_dims.x, block_dims.y/2, block_dims.z);
 
-    mul_mat_q<type, J, fallback><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
-        (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.y_scale,
-         blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
-         channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
-         sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-         ntx_fd);
+    if constexpr (type == GGML_TYPE_Q4_K) {
+        // The compact Q4_K layout is a prefill optimization on GB203.  It
+        // improves large activation matrices, but the extra address work is
+        // counterproductive for the small speculative/decode batches.  Keep
+        // the legacy layout below the phase boundary so a single DLL can use
+        // the fastest path for both phases without changing quantization.
+        static const long simple_layout_min_cols = []() {
+            const char * value = std::getenv("LLAMA_MMQ_Q4_SIMPLE_LAYOUT_MIN_COLS");
+            if (value == nullptr) {
+                return 256L;
+            }
+            char * end = nullptr;
+            const long parsed = std::strtol(value, &end, 10);
+            return end != value && *end == '\0' && parsed >= 0 ? parsed : 256L;
+        }();
+        const bool dense_simple_layout = args.ids_dst == nullptr && args.nchannels_y == 1 && args.nsamples_y == 1 &&
+            args.ncols_dst >= simple_layout_min_cols;
+        if (dense_simple_layout) {
+            mul_mat_q<type, J, fallback, true><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
+                (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.y_scale,
+                 blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                 channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                 sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+                 ntx_fd);
+        } else {
+            mul_mat_q<type, J, fallback, false><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
+                (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.y_scale,
+                 blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                 channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                 sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+                 ntx_fd);
+        }
+    } else {
+        mul_mat_q<type, J, fallback, false><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
+            (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.y_scale,
+             blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+             channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+             sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+             ntx_fd);
+    }
 
     if (!fixup_needed) {
+#if defined(GGML_CUDA_Q6_K_BLACKWELL_TUNING)
+        reset_q6_l2_policy();
+#endif
+#if defined(GGML_CUDA_Q4_K_BLACKWELL_TUNING)
+        reset_q4_l2_policy();
+#endif
         return;
     }
 
@@ -1464,6 +1934,12 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
         (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
          args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
          ntx_fd);
+#if defined(GGML_CUDA_Q6_K_BLACKWELL_TUNING)
+    reset_q6_l2_policy();
+#endif
+#if defined(GGML_CUDA_Q4_K_BLACKWELL_TUNING)
+    reset_q4_l2_policy();
+#endif
 }
 
 template <ggml_type type, bool fallback>
@@ -1475,21 +1951,80 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
 
-    for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
-        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
-        if (config.type == GGML_TYPE_COUNT) {
-            continue;
+    static const long requested_J = []() {
+        const char * value = std::getenv("LLAMA_MMQ_FORCE_J");
+        if (value == nullptr) {
+            return 0L;
         }
-
-        if (mmq_get_nbytes_shared(config, cc) > smpbo) {
-            continue;
+        char * end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        return end != value && *end == '\0' ? parsed : 0L;
+    }();
+    if (args.ncols_max >= 256 && requested_J != 0) {
+#if defined(GGML_CUDA_Q6_K_BLACKWELL_TUNING)
+        constexpr long max_forced_J = 256;
+#else
+        constexpr long max_forced_J = 128;
+#endif
+        if (requested_J >= 8 && requested_J <= max_forced_J && requested_J % 8 == 0) {
+            const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, (int) requested_J, fallback, cc);
+            if (config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo) {
+                J_best = (int) requested_J;
+            }
         }
+    }
 
-        const int ntiles_x = (args.ncols_max + config.J - 1) / config.J;
+    // The scheduler launches the same projection shapes once per layer.  The
+    // old selector rescanned every supported J (up to 16 configs) for each
+    // launch.  A tiny per-scheduler-thread direct-mapped cache preserves the
+    // exact selected J while removing that repeated host-side work.
+    struct j_selector_cache_entry {
+        int64_t ncols_max;
+        int     J;
+    };
+    static thread_local j_selector_cache_entry j_selector_cache[32] = {};
+    j_selector_cache_entry * cache_entry = nullptr;
+    if (J_best == 0 && requested_J == 0) {
+        cache_entry = &j_selector_cache[uint64_t(args.ncols_max) & 31u];
+        if (cache_entry->J != 0 && cache_entry->ncols_max == args.ncols_max) {
+            J_best = cache_entry->J;
+        }
+    }
 
-        if (ntiles_x < ntiles_J_best) {
-            J_best = J;
-            ntiles_J_best = ntiles_x;
+    if (J_best == 0) {
+        for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
+            const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
+            if (config.type == GGML_TYPE_COUNT) {
+                continue;
+            }
+
+            if (mmq_get_nbytes_shared(config, cc) > smpbo) {
+                continue;
+            }
+
+            const int ntiles_x = (args.ncols_max + config.J - 1) / config.J;
+
+            if (ntiles_x < ntiles_J_best) {
+                J_best = J;
+                ntiles_J_best = ntiles_x;
+            }
+        }
+        if (cache_entry != nullptr && J_best != 0) {
+            cache_entry->ncols_max = args.ncols_max;
+            cache_entry->J = J_best;
+        }
+    }
+
+    static const bool mmq_trace = std::getenv("LLAMA_MMQ_TRACE") != nullptr;
+    if (mmq_trace) {
+        static int trace_count = 0;
+        if (trace_count++ < 64) {
+            fprintf(stderr, "MMQ_TRACE type=%s J=%d fallback=%d ncols_x=%lld nrows_x=%lld ncols_dst=%lld ncols_max=%lld smpbo=%zu stream_k=%d disabled=%d\n",
+                    ggml_type_name(type), J_best, fallback ? 1 : 0,
+                    (long long) args.ncols_x, (long long) args.nrows_x,
+                    (long long) args.ncols_dst, (long long) args.ncols_max, smpbo,
+                    ggml_cuda_mmq_get_stream_k(type, J_best, fallback, cc) ? 1 : 0,
+                    []() { static const bool disabled = std::getenv("LLAMA_MMQ_DISABLE_STREAM_K") != nullptr; return disabled; }() ? 1 : 0);
         }
     }
 
@@ -1542,6 +2077,15 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
         case 128:
             launch_mul_mat_q<type, 128, fallback>(ctx, args, stream);
             break;
+#if defined(GGML_CUDA_Q6_K_BLACKWELL_TUNING)
+        case 256:
+            if constexpr (type == GGML_TYPE_Q6_K) {
+                launch_mul_mat_q<type, 256, fallback>(ctx, args, stream);
+            } else {
+                GGML_ABORT("J=256 is only enabled for the GB203 Q6_K experiment");
+            }
+            break;
+#endif
         default:
             fprintf(stderr, "J_best=%d\n", J_best);
             GGML_ABORT("fatal error");

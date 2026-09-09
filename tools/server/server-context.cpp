@@ -11,6 +11,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../../src/llama-ext.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -20,6 +21,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -291,7 +293,13 @@ struct server_slot {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         mem.seq_rm(id, -1, -1);
+        common_speculative_reset(spec, id);
 
+        spec_draft.clear();
+        spec_prompt.clear();
+        spec_i_batch.clear();
+        spec_ckpt.clear();
+        spec_is_replay = false;
         prompt.clear();
     }
 
@@ -450,6 +458,23 @@ struct server_slot {
 
         if (n_remaining() > 0) {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
+        }
+
+        // Keep a single server profile fast at short context without paying the
+        // larger MTP graph at long context.  The global --spec-draft-n-max is
+        // still the hard ceiling; this optional clamp only lowers it once the
+        // effective sequence reaches the configured threshold.
+        static const int32_t long_ctx_threshold = []() {
+            const char * value = std::getenv("LLAMA_SPEC_DRAFT_LONG_CTX_THRESHOLD");
+            return value ? std::max(0, std::atoi(value)) : -1;
+        }();
+        static const int32_t long_ctx_n_max = []() {
+            const char * value = std::getenv("LLAMA_SPEC_DRAFT_LONG_CTX_N_MAX");
+            return value ? std::max(0, std::atoi(value)) : -1;
+        }();
+
+        if (long_ctx_threshold >= 0 && long_ctx_n_max >= 0 && prompt.n_tokens() >= long_ctx_threshold) {
+            n_draft_max = std::min(n_draft_max, long_ctx_n_max);
         }
 
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
@@ -847,6 +872,13 @@ private:
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
+    // Recurrent/hybrid memory cannot apply a historical KV shift in-place.
+    // Keep this capability separate from the user-facing ctx-shift setting:
+    // queued requests also need an exact fallback when they shorten a cached
+    // history beyond the recurrent rollback window.
+    bool history_edits_via_replay = false;
+    bool ctx_shift_via_replay     = false;
+
     common_speculative_ptr spec;
 
     bool add_bos_token = true;
@@ -961,6 +993,8 @@ private:
         load_progress_data load_progress_spec  (this, "spec_model");
 
         const bool is_resume = sleeping;
+
+        const bool ctx_shift_requested = params.ctx_shift;
 
         params_base = params;
         const auto output_limits = server_output_limits(params_base);
@@ -1118,6 +1152,20 @@ private:
             return false;
         }
 
+        history_edits_via_replay =
+            !has_mmproj &&
+            !llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
+            (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt));
+        ctx_shift_via_replay = ctx_shift_requested && history_edits_via_replay;
+
+        if (ctx_shift_via_replay) {
+            // common_init_from_params disables the generic in-place shift for
+            // this memory type.  Restore the user's server-level request: the
+            // server uses the exact clear+replay path below instead.
+            params_base.ctx_shift = true;
+            SRV_WRN("%s\n", "context shifts will use exact clear+replay for recurrent/hybrid memory");
+        }
+
         vocab = llama_model_get_vocab(model_tgt);
 
         n_ctx = llama_n_ctx(ctx_tgt);
@@ -1185,7 +1233,7 @@ private:
         }
 
         if (!llama_memory_can_shift(llama_get_memory(ctx_tgt))) {
-            if (params_base.ctx_shift) {
+            if (params_base.ctx_shift && !ctx_shift_via_replay) {
                 params_base.ctx_shift = false;
                 SRV_WRN("%s\n", "ctx_shift is not supported by this context, it will be disabled");
             }
@@ -1281,6 +1329,30 @@ private:
                 if (slot.stats.n_gen > 0) {
                     metrics_on_prediction(slot);
                 }
+
+                const char * request_reset = std::getenv("LLAMA_COMPUTE_SPARSE_REQUEST_RESET");
+                if (request_reset != nullptr && std::strcmp(request_reset, "0") != 0) {
+                    const bool reset_trace = std::getenv("LLAMA_COMPUTE_SPARSE_REQUEST_RESET_TRACE") != nullptr;
+                    if (reset_trace) { std::fprintf(stderr, "REQUEST_RESET_STAGE: sync-begin\n"); std::fflush(stderr); }
+                    // Target and native-MTP may alias the same physical arena.
+                    // Synchronize both first, then invalidate both graph caches;
+                    // the backend de-duplicates/serializes the actual trim.
+                    llama_synchronize(ctx_tgt);
+                    if (ctx_dft != nullptr) {
+                        llama_synchronize(ctx_dft);
+                    }
+                    if (reset_trace) { std::fprintf(stderr, "REQUEST_RESET_STAGE: sync-done target-reset-begin\n"); std::fflush(stderr); }
+                    llama_compute_arena_request_reset(ctx_tgt);
+                    if (reset_trace) { std::fprintf(stderr, "REQUEST_RESET_STAGE: target-reset-done\n"); std::fflush(stderr); }
+                    if (ctx_dft != nullptr) {
+                        // Native MTP aliases the target's physical compute
+                        // arena. Do not trim/synchronize that arena twice;
+                        // only invalidate the draft graph bindings.
+                        llama_compute_arena_request_invalidate(ctx_dft);
+                        if (reset_trace) { std::fprintf(stderr, "REQUEST_RESET_STAGE: draft-invalidate-done\n"); std::fflush(stderr); }
+                    }
+                    if (reset_trace) { std::fprintf(stderr, "REQUEST_RESET_STAGE: callback-done\n"); std::fflush(stderr); }
+                }
             };
 
             slot.reset();
@@ -1304,10 +1376,11 @@ private:
             }
         }
 
-        // the update_slots() logic will always submit a maximum of n_batch or n_parallel tokens
-        // note that n_batch can be > n_ctx (e.g. for non-causal attention models such as BERT where the KV cache is not used)
+        // The experimental Qwen layer-major scheduler can aggregate several
+        // physical batches into one prompt window. Generation still uses only
+        // the rows it needs.
         {
-            const int32_t n_batch = llama_n_batch(ctx_tgt);
+            const int32_t n_batch = llama_prefill_batch_size(ctx_tgt);
             const int32_t n_embd  = llama_model_n_embd_inp(model_tgt);
             batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
         }
@@ -2796,7 +2869,7 @@ private:
 
         llama_batch batch_view;
         int32_t off_next = 0;
-        int32_t n_batch = llama_n_batch(ctx_tgt);
+        int32_t n_batch = llama_prefill_batch_size(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
             try {
@@ -2814,7 +2887,7 @@ private:
                     off_next = off + n_tokens;
 
                     // on successful decode, restore the original batch size
-                    n_batch = llama_n_batch(ctx_tgt);
+                    n_batch = llama_prefill_batch_size(ctx_tgt);
                 } else {
                     // try again with the updated n_batch
                     continue;
@@ -2834,6 +2907,108 @@ private:
                 break; // stop any further processing
             }
         }
+    }
+
+    bool clear_slot_context_for_replay(server_slot & slot, const char * reason) {
+        // Memory edits happen between decode iterations, but explicitly drain
+        // both contexts before invalidating their state.  This also gives the
+        // sparse/ring backend a clean sequence boundary.
+        llama_synchronize(ctx_tgt);
+        if (ctx_dft && ctx_dft != ctx_tgt) {
+            llama_synchronize(ctx_dft);
+        }
+
+        if (!slot.mem.try_seq_rm(slot.id, -1, -1)) {
+            SLT_ERR(slot, "failed to clear target/draft memory for exact replay (%s)\n", reason);
+            return false;
+        }
+
+        common_speculative_reset(spec.get(), slot.id);
+        slot.spec_draft.clear();
+        slot.spec_prompt.clear();
+        slot.spec_i_batch.clear();
+        slot.spec_ckpt.clear();
+        slot.spec_is_replay = false;
+        return true;
+    }
+
+    bool replay_slot_context_exact(server_slot & slot, const llama_tokens & tokens, const char * reason) {
+        if (slot.prompt.tokens.has_mtmd) {
+            SLT_ERR(slot, "cannot replay a multimodal context during %s\n", reason);
+            return false;
+        }
+
+        // Activated LoRA needs a position-dependent adapter transition during
+        // replay.  Refuse rather than silently rebuilding different logits.
+        if (lora_all_alora(slot.lora) && slot.alora_invocation_start > 0) {
+            SLT_ERR(slot, "exact context replay with activated aLoRA is not implemented (%s)\n", reason);
+            return false;
+        }
+
+        if (!clear_slot_context_for_replay(slot, reason)) {
+            return false;
+        }
+
+        if (tokens.empty()) {
+            return true;
+        }
+
+        const bool need_embd = slot.need_embd();
+        llama_set_embeddings(ctx_tgt, need_embd);
+        common_set_adapter_lora(ctx_tgt, slot.lora);
+
+        const int32_t n_batch = std::max<int32_t>(1, llama_prefill_batch_size(ctx_tgt));
+        llama_batch replay = llama_batch_init(n_batch, 0, 1);
+        bool ok = true;
+
+        for (size_t off = 0; off < tokens.size() && ok; off += n_batch) {
+            common_batch_clear(replay);
+            const int32_t count = (int32_t) std::min<size_t>(n_batch, tokens.size() - off);
+
+            for (int32_t i = 0; i < count; ++i) {
+                const size_t index = off + (size_t) i;
+                // Native MTP consumes h_nextn for every row.  Other paths
+                // only need the final row to seed the next decode.
+                const bool output = need_embd || index + 1 == tokens.size();
+                common_batch_add(replay, tokens[index], (llama_pos) index, { slot.id }, output);
+            }
+
+            llama_set_recurrent_transaction(ctx_tgt, false);
+            const int32_t rc = llama_decode(ctx_tgt, replay);
+            if (rc != 0) {
+                SLT_ERR(slot, "exact context replay failed at token %zu/%zu, rc=%d (%s)\n",
+                        off, tokens.size(), rc, reason);
+                ok = false;
+                break;
+            }
+
+            // MTP consumes the target hidden rows immediately.  Synchronizing
+            // here is intentionally outside the steady-state decode path; a
+            // context rebuild is rare and correctness takes precedence.
+            llama_synchronize(ctx_tgt);
+            if (spec && !common_speculative_process(spec.get(), replay)) {
+                SLT_ERR(slot, "failed to rebuild speculative state at token %zu/%zu (%s)\n",
+                        off, tokens.size(), reason);
+                ok = false;
+                break;
+            }
+        }
+
+        if (ok && spec) {
+            if (ctx_dft && ctx_dft != ctx_tgt) {
+                llama_synchronize(ctx_dft);
+            }
+            common_speculative_begin(spec.get(), slot.id, tokens);
+        }
+
+        llama_batch_free(replay);
+
+        if (!ok) {
+            // Do not leave a partially replayed sequence available for reuse.
+            clear_slot_context_for_replay(slot, "failed replay cleanup");
+        }
+
+        return ok;
     }
 
     void pre_decode() {
@@ -2878,25 +3053,40 @@ private:
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
-                slot.mem.seq_rm (slot.id, n_keep            , n_keep + n_discard);
-                slot.mem.seq_add(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
+                GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
 
-                // add generated tokens to cache
-                // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
-                {
-                    GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
+                // Build the retained logical sequence before touching either
+                // attention KV or recurrent state.  A recurrent state cannot be
+                // repaired by seq_rm()+seq_add(): removing historical tokens
+                // requires recomputing every surviving token after the edit.
+                llama_tokens new_tokens = slot.prompt.tokens.get_tokens();
+                for (size_t i = (size_t) n_keep + (size_t) n_discard; i < new_tokens.size(); ++i) {
+                    new_tokens[i - (size_t) n_discard] = new_tokens[i];
+                }
+                new_tokens.resize(slot.prompt.tokens.size() - (size_t) n_discard);
 
-                    llama_tokens new_tokens = slot.prompt.tokens.get_tokens(); // copy
-                    for (size_t i = n_keep + n_discard; i < new_tokens.size(); i++) {
-                        new_tokens[i - n_discard] = new_tokens[i];
+                bool shift_ok = true;
+                if (ctx_shift_via_replay) {
+                    shift_ok = replay_slot_context_exact(slot, new_tokens, "context shift");
+                } else {
+                    shift_ok = slot.mem.try_seq_rm(slot.id, n_keep, n_keep + n_discard);
+                    if (shift_ok) {
+                        slot.mem.seq_add(slot.id, n_keep + n_discard,
+                                slot.prompt.tokens.pos_next(), -n_discard);
                     }
-
-                    new_tokens.resize(slot.prompt.tokens.size() - n_discard);
-
-                    slot.prompt.clear();
-                    slot.prompt.tokens.insert(new_tokens);
                 }
 
+                if (!shift_ok) {
+                    send_error(slot, "failed to rebuild context during context shift", ERROR_TYPE_SERVER);
+                    slot.release();
+                    return;
+                }
+
+                // Publish the token-list change only after the model state has
+                // been rebuilt successfully.  prompt.clear() also drops stale
+                // checkpoints that refer to the pre-compaction history.
+                slot.prompt.clear();
+                slot.prompt.tokens.insert(new_tokens);
                 slot.truncated = true;
             }
         });
@@ -2953,7 +3143,12 @@ private:
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
-                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        const char * skip_unused_history_env = std::getenv("LLAMA_MTP_SKIP_UNUSED_PROMPT_HISTORY");
+                        const bool skip_unused_history = skip_unused_history_env != nullptr &&
+                                std::strcmp(skip_unused_history_env, "0") != 0;
+                        if (!skip_unused_history || common_speculative_needs_prompt_history(spec.get())) {
+                            slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        }
 
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
@@ -2993,7 +3188,9 @@ private:
                 }
 
                 if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
-                    GGML_ABORT("failed to remove sequence %d\n", slot.id);
+                    throw std::runtime_error(string_format(
+                            "failed to roll back draft sequence %d to position %d",
+                            slot.id, ckpt.pos_max + 1));
                 }
             }
 
@@ -3030,8 +3227,9 @@ private:
             slot.handle_last_sampled_token(batch);
         });
 
-        // process in chunks of params.n_batch
-        int32_t n_batch  = llama_n_batch(ctx_tgt);
+        // Process prompts in the internal scheduler window. The CUDA graph is
+        // still bounded by n_ubatch.
+        int32_t n_batch  = llama_prefill_batch_size(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
 
         auto & alora_scale       = batch.alora_scale;
@@ -3090,8 +3288,19 @@ private:
                             }
                         }*/
 
+                        // Keep the old logical length so we can distinguish an
+                        // append-only reuse (safe) from a history truncation.  MTP
+                        // carries hidden state across calls and has no per-token
+                        // rollback log, so a shortened recurrent/hybrid history is
+                        // rebuilt from token zero rather than paired with stale h.
+                        const size_t n_cached_before = slot.prompt.tokens.size();
+
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
+
+                        // Set when a shortened hybrid history resumes from an
+                        // exact recurrent/MTP checkpoint instead of token zero.
+                        bool restored_recurrent_prefix = false;
 
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
@@ -3196,7 +3405,11 @@ private:
 
                                             const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
 
-                                            slot.mem.seq_rm (slot.id, head_p, head_c);
+                                            if (!slot.mem.try_seq_rm(slot.id, head_p, head_c)) {
+                                                throw std::runtime_error(string_format(
+                                                        "failed to remove cached range [%zu, %zu) while reusing prompt chunks",
+                                                        head_p, head_c));
+                                            }
                                             slot.mem.seq_add(slot.id, head_c, head_c + n_match, kv_shift);
 
                                             for (size_t i = 0; i < n_match; i++) {
@@ -3218,6 +3431,75 @@ private:
                                 n_past = 0;
                             }
 
+                            // A hybrid recurrent checkpoint contains the exact
+                            // recurrent state and the MTP boundary state, but not
+                            // the attention KV (PARTIAL_ONLY). When a new request
+                            // rewrites only the tail, restore the newest checkpoint
+                            // inside the common prefix, trim only stale attention KV,
+                            // and resume decoding there. This keeps the immutable
+                            // prefix resident instead of replaying from token zero.
+                            if (history_edits_via_replay && spec && n_past > 0 &&
+                                    (size_t) n_past < n_cached_before) {
+                                const auto checkpoint = std::find_if(
+                                        slot.prompt.checkpoints.rbegin(),
+                                        slot.prompt.checkpoints.rend(),
+                                        [&](const auto & cur) {
+                                            const bool has_draft_state =
+                                                !ctx_dft || ctx_dft == ctx_tgt || !cur.data_dft.empty();
+                                            return cur.n_tokens > 0 && cur.n_tokens <= n_past &&
+                                                !cur.data_tgt.empty() && has_draft_state;
+                                        });
+
+                                if (checkpoint != slot.prompt.checkpoints.rend()) {
+                                    const bool target_can_trim = llama_memory_can_rm_attn(
+                                            llama_get_memory(ctx_tgt));
+                                    const bool draft_can_trim =
+                                        !ctx_dft || ctx_dft == ctx_tgt || llama_memory_can_rm_attn(
+                                            llama_get_memory(ctx_dft));
+
+                                    if (!target_can_trim || !draft_can_trim) {
+                                        SLT_WRN(slot, "%s",
+                                            "attention-only checkpoint trim is unavailable; "
+                                            "falling back to full exact replay\n");
+                                    } else {
+                                    llama_synchronize(ctx_tgt);
+                                    if (ctx_dft && ctx_dft != ctx_tgt) {
+                                        llama_synchronize(ctx_dft);
+                                    }
+
+                                    checkpoint->load_tgt(
+                                            ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                    checkpoint->load_dft(
+                                            ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                    common_speculative_set_state(
+                                            spec.get(), slot.id, checkpoint->data_spec);
+
+                                    const llama_pos trim_from =
+                                        slot.prompt.tokens.pos_next((size_t) checkpoint->n_tokens);
+                                    bool attn_trimmed = llama_memory_seq_rm_attn(
+                                            llama_get_memory(ctx_tgt), slot.id, trim_from, -1);
+                                    if (ctx_dft && ctx_dft != ctx_tgt) {
+                                        attn_trimmed = llama_memory_seq_rm_attn(
+                                                llama_get_memory(ctx_dft), slot.id, trim_from, -1) &&
+                                            attn_trimmed;
+                                    }
+
+                                    if (attn_trimmed) {
+                                        n_past = (int) checkpoint->n_tokens;
+                                        restored_recurrent_prefix = true;
+                                        SLT_INF(slot,
+                                            "restored immutable recurrent prefix at %d tokens; "
+                                            "replaying only the changed suffix\n",
+                                            n_past);
+                                    } else {
+                                        SLT_WRN(slot, "%s",
+                                            "attention-only checkpoint trim failed; "
+                                            "falling back to full exact replay\n");
+                                    }
+                                    }
+                                }
+                            }
+
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
@@ -3226,7 +3508,7 @@ private:
                             // the largest pos_min required for a checkpoint to be useful
                             const auto pos_min_thold = std::max(0, pos_next - n_swa - (has_new_tokens ? 0 : 1));
 
-                            if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
+                            if (!restored_recurrent_prefix && n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                                 if (pos_min == -1) {
                                     SLT_ERR(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min);
@@ -3336,12 +3618,43 @@ private:
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
 
-                        slot.stats.n_prompt_cached    = n_past;
-                        slot.stats.n_prompt_processed = 0;
-
-                        metrics.add_prompt_cached(n_past);
-
                         slot.prompt.tokens.keep_first(n_past);
+
+                        // Truncate model memory while we still know this is the
+                        // first pass for the request.  If the edit cannot be
+                        // represented, fall back to a complete clear and let the
+                        // normal prompt path replay the request from token zero.
+                        const llama_pos p0 = slot.prompt.tokens.pos_next();
+                        const bool shortened_history = (size_t) n_past < n_cached_before;
+                        const bool force_exact_replay =
+                            history_edits_via_replay && spec && shortened_history &&
+                            !restored_recurrent_prefix;
+
+                        SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end), force_replay = %d\n",
+                                slot.prompt.n_tokens(), p0, (int) force_exact_replay);
+
+                        bool memory_trimmed = restored_recurrent_prefix;
+                        if (!memory_trimmed && !force_exact_replay) {
+                            memory_trimmed = slot.mem.try_seq_rm(slot.id, p0, -1);
+                        }
+
+                        if (!memory_trimmed) {
+                            SLT_WRN(slot,
+                                    "cached history cannot be truncated exactly; reprocessing prompt from token zero "
+                                    "(cached_before=%zu, requested_prefix=%d)\n",
+                                    n_cached_before, n_past);
+                            if (!clear_slot_context_for_replay(slot, "queued request / prompt-cache rollback")) {
+                                send_error(slot, "failed to reset context for prompt replay", ERROR_TYPE_SERVER);
+                                slot.release();
+                                return;
+                            }
+                            slot.prompt.clear();
+                            n_past = 0;
+                        }
+
+                        slot.stats.n_prompt_cached     = n_past;
+                        slot.stats.n_prompt_processed  = 0;
+                        metrics.add_prompt_cached(n_past);
 
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
@@ -3366,12 +3679,10 @@ private:
                     //       the tokens added to the batch below
                     slot.print_timings_pp();
 
-                    // truncate any tokens that are beyond n_past for this slot
-                    const llama_pos p0 = slot.prompt.tokens.pos_next();
-
-                    SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
-
-                    slot.mem.seq_rm(slot.id, p0, -1);
+                    // The cached tail was truncated once, atomically, in the
+                    // SLOT_STATE_STARTED block above.  Repeating that operation
+                    // on every prompt microbatch is both unnecessary and unsafe
+                    // for recurrent/MTP state.
 
                     // If using an alora, there may be uncached tokens that come
                     // before the invocation sequence. When this happens, the
@@ -3605,11 +3916,22 @@ private:
             has_output |= batch.tokens[i].output;
         }
 
+        bool speculative_verify = false;
+        if (llama_recurrent_transaction_deferred(ctx_tgt)) {
+            iterate(slots, [&](server_slot & slot) {
+                for (int32_t i : slot.spec_i_batch) {
+                    speculative_verify |= i >= off && i < off + batch_view.n_tokens;
+                }
+            });
+        }
+
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
+            llama_set_recurrent_transaction(ctx_tgt, speculative_verify);
             ret = llama_decode(ctx_tgt, batch_view);
+            llama_set_recurrent_transaction(ctx_tgt, false);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
@@ -3841,7 +4163,25 @@ private:
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                const auto * draft_probs = common_speculative_get_draft_probs(spec.get(), slot.id);
+                const bool use_rejection = [] {
+                    const char * value = std::getenv("LLAMA_SPEC_REJECTION_SAMPLING");
+                    return value != nullptr && std::strcmp(value, "0") != 0;
+                }();
+                auto accepted = use_rejection && draft_probs
+                    ? common_sampler_sample_and_accept_n_rejection(
+                            slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, *draft_probs)
+                    : common_sampler_sample_and_accept_n(
+                            slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+
+                if (llama_recurrent_transaction_deferred(ctx_tgt)) {
+                    if (ctx_dft) {
+                        llama_synchronize(ctx_dft);
+                    }
+                    if (!llama_recurrent_transaction_accept(ctx_tgt, slot.id, (uint32_t) accepted.size())) {
+                        throw std::runtime_error("failed to commit recurrent speculative transaction");
+                    }
+                }
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -3873,7 +4213,11 @@ private:
                             ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
-                        slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
+                        if (!slot.mem.try_seq_rm(slot.id, ckpt.pos_max + 1, -1)) {
+                            throw std::runtime_error(string_format(
+                                    "failed to trim speculative state after restoring checkpoint at position %d",
+                                    ckpt.pos_max));
+                        }
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
@@ -3920,7 +4264,11 @@ private:
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
-            slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            if (!slot.mem.try_seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1)) {
+                throw std::runtime_error(string_format(
+                        "failed to trim rejected speculative tail at position %d",
+                        slot.prompt.tokens.pos_next()));
+            }
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;

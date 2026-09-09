@@ -11,7 +11,11 @@
 #include <cctype>
 #include <climits>
 #include <cmath>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <random>
 #include <unordered_map>
 #include <vector>
 
@@ -121,10 +125,16 @@ struct common_sampler {
 
     llama_token_data_array cur_p;
 
+    // Independent RNG for distribution-preserving speculative rejection. It
+    // is copied with the sampler so speculative checkpoint rollback is exact.
+    uint32_t spec_seed;
+    std::mt19937 spec_rng;
+
     void reset() {
         prev.clear();
 
         llama_sampler_reset(chain);
+        spec_rng.seed(spec_seed);
     }
 
     void set_logits(struct llama_context * ctx, int idx) {
@@ -432,6 +442,8 @@ struct common_sampler * common_sampler_init(
         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
         /* .cur     = */ {},
         /* .cur_p   = */ {},
+        /* .spec_seed = */ llama_sampler_get_seed(chain),
+        /* .spec_rng  = */ std::mt19937(llama_sampler_get_seed(chain)),
     };
 
     return result;
@@ -515,6 +527,8 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .prev    = */ gsmpl->prev,
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
+        /* .spec_seed = */ gsmpl->spec_seed,
+        /* .spec_rng  = */ gsmpl->spec_rng,
     };
 }
 
@@ -535,6 +549,8 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur        = src->cur;
     dst->cur_p      = src->cur_p;
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
+    dst->spec_seed  = src->spec_seed;
+    dst->spec_rng   = src->spec_rng;
     dst->t_total_us = src->t_total_us;
 }
 
@@ -591,8 +607,15 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
-llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
-    llama_synchronize(ctx);
+static llama_token common_sampler_sample_impl(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        int idx,
+        bool grammar_first,
+        bool synchronize) {
+    if (synchronize) {
+        llama_synchronize(ctx);
+    }
 
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
     const auto tm = gsmpl->tm();
@@ -675,15 +698,21 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     return id;
 }
 
+llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
+    return common_sampler_sample_impl(gsmpl, ctx, idx, grammar_first, true);
+}
+
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+
+    llama_synchronize(ctx);
 
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
     size_t i = 0;
     for (; i < draft.size(); i++) {
-        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        const llama_token id = common_sampler_sample_impl(gsmpl, ctx, idxs[i], grammar_first, false);
 
         common_sampler_accept(gsmpl, id, true);
 
@@ -695,10 +724,207 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     }
 
     if (i == draft.size()) {
-        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        const llama_token id = common_sampler_sample_impl(gsmpl, ctx, idxs[i], grammar_first, false);
 
         common_sampler_accept(gsmpl, id, true);
 
+        result.push_back(id);
+    }
+
+    return result;
+}
+
+static double common_sampler_prob_of(
+        const llama_token_data * data, size_t size, llama_token id, double sum) {
+    if (!(sum > 0.0)) {
+        return 0.0;
+    }
+    for (size_t i = 0; i < size; ++i) {
+        if (data[i].id == id) {
+            return std::max(0.0, (double) data[i].p) / sum;
+        }
+    }
+    return 0.0;
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens & draft,
+        const std::vector<std::vector<llama_token_data>> & draft_probs,
+        bool grammar_first) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+
+    if (draft_probs.size() < draft.size()) {
+        return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
+    }
+
+    llama_synchronize(ctx);
+
+    // Residual sampling needs the entire p distribution to obey the grammar,
+    // not only a post-hoc validity check on one selected token.
+    const bool full_grammar = grammar_first || gsmpl->grmr != nullptr;
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    size_t i = 0;
+    for (; i < draft.size(); ++i) {
+        const llama_token sampled_p = common_sampler_sample_impl(gsmpl, ctx, idxs[i], full_grammar, false);
+        const auto * p_arr = common_sampler_get_candidates(gsmpl, false);
+        const auto & q_vec = draft_probs[i];
+
+        double p_sum = 0.0;
+        for (size_t k = 0; k < p_arr->size; ++k) {
+            p_sum += std::max(0.0, (double) p_arr->data[k].p);
+        }
+        double q_sum = 0.0;
+        for (const auto & item : q_vec) {
+            q_sum += std::max(0.0, (double) item.p);
+        }
+
+        // If a backend did not expose probabilities, use the already sampled
+        // target token. This is distribution-safe, merely less speculative.
+        if (!(p_sum > 0.0) || !(q_sum > 0.0)) {
+            common_sampler_accept(gsmpl, sampled_p, true);
+            result.push_back(sampled_p);
+            break;
+        }
+
+        const llama_token proposed = draft[i];
+        const double p_x = common_sampler_prob_of(p_arr->data, p_arr->size, proposed, p_sum);
+        const double q_x = common_sampler_prob_of(q_vec.data(), q_vec.size(), proposed, q_sum);
+        const double accept_p = q_x > 0.0 ? std::min(1.0, p_x / q_x) : 0.0;
+        const double u = std::generate_canonical<double, 53>(gsmpl->spec_rng);
+        double overlap = 0.0;
+        for (size_t k = 0; k < p_arr->size; ++k) {
+            const llama_token id = p_arr->data[k].id;
+            const double p_k = std::max(0.0, (double) p_arr->data[k].p) / p_sum;
+            const double q_k = common_sampler_prob_of(q_vec.data(), q_vec.size(), id, q_sum);
+            overlap += std::min(p_k, q_k);
+        }
+
+        if (std::getenv("LLAMA_SPEC_REJECTION_STATS") != nullptr && i < 8) {
+            struct rank_stats {
+                uint64_t n[8] = {};
+                double p_rank[8][10] = {};
+                double p_outside[8] = {};
+                double overlap[8] = {};
+                double accept_p[8] = {};
+                uint64_t accepted[8] = {};
+                double overlap_grid[8][9] = {};
+            };
+            static rank_stats stats;
+            const size_t pos = i;
+            double covered = 0.0;
+            for (size_t rank = 0; rank < std::min<size_t>(10, q_vec.size()); ++rank) {
+                const double p_rank = common_sampler_prob_of(
+                        p_arr->data, p_arr->size, q_vec[rank].id, p_sum);
+                stats.p_rank[pos][rank] += p_rank;
+                covered += p_rank;
+            }
+            stats.p_outside[pos] += std::max(0.0, 1.0 - covered);
+            stats.overlap[pos] += overlap;
+            stats.accept_p[pos] += accept_p;
+            stats.accepted[pos] += u <= accept_p;
+            static constexpr double grid[9] = { 0.10, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50, 0.70, 1.00 };
+            const double active_temp = [] {
+                const char * value = std::getenv("LLAMA_MTP_PROPOSAL_TEMP");
+                return value ? std::max(0.01, std::strtod(value, nullptr)) : 1.0;
+            }();
+            for (size_t g = 0; g < 9; ++g) {
+                double max_logit = -INFINITY;
+                for (const auto & item : q_vec) {
+                    max_logit = std::max(max_logit, (double) item.logit * active_temp / grid[g]);
+                }
+                std::vector<double> q_grid(q_vec.size(), 0.0);
+                double q_grid_sum = 0.0;
+                for (size_t rank = 0; rank < q_vec.size(); ++rank) {
+                    q_grid[rank] = std::exp((double) q_vec[rank].logit * active_temp / grid[g] - max_logit);
+                    q_grid_sum += q_grid[rank];
+                }
+                double overlap_g = 0.0;
+                for (size_t rank = 0; rank < q_vec.size(); ++rank) {
+                    const double p_rank = common_sampler_prob_of(
+                            p_arr->data, p_arr->size, q_vec[rank].id, p_sum);
+                    overlap_g += std::min(p_rank, q_grid[rank] / q_grid_sum);
+                }
+                stats.overlap_grid[pos][g] += overlap_g;
+            }
+            stats.n[pos]++;
+
+            if (pos == 0 && (stats.n[0] % 64) == 0) {
+                for (size_t report_pos = 0; report_pos < 8; ++report_pos) {
+                    if (stats.n[report_pos] == 0) {
+                        continue;
+                    }
+                    const double n = (double) stats.n[report_pos];
+                    std::fprintf(stderr, "SPEC_REJECTION_RANK: pos=%zu n=%" PRIu64
+                            " p_rank=%.4f,%.4f,%.4f,%.4f,%.4f outside=%.4f overlap=%.4f accept_p=%.4f accepted=%.4f\n",
+                            report_pos + 1, stats.n[report_pos],
+                            stats.p_rank[report_pos][0] / n,
+                            stats.p_rank[report_pos][1] / n,
+                            stats.p_rank[report_pos][2] / n,
+                            stats.p_rank[report_pos][3] / n,
+                            stats.p_rank[report_pos][4] / n,
+                            stats.p_outside[report_pos] / n,
+                            stats.overlap[report_pos] / n,
+                            stats.accept_p[report_pos] / n,
+                            stats.accepted[report_pos] / n);
+                    std::fprintf(stderr,
+                            "SPEC_REJECTION_GRID: pos=%zu temps=.10,.20,.25,.30,.35,.40,.50,.70,1.00 overlap=%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+                            report_pos + 1,
+                            stats.overlap_grid[report_pos][0] / n,
+                            stats.overlap_grid[report_pos][1] / n,
+                            stats.overlap_grid[report_pos][2] / n,
+                            stats.overlap_grid[report_pos][3] / n,
+                            stats.overlap_grid[report_pos][4] / n,
+                            stats.overlap_grid[report_pos][5] / n,
+                            stats.overlap_grid[report_pos][6] / n,
+                            stats.overlap_grid[report_pos][7] / n,
+                            stats.overlap_grid[report_pos][8] / n);
+                }
+                std::fflush(stderr);
+            }
+        }
+
+        if (u <= accept_p) {
+            common_sampler_accept(gsmpl, proposed, true);
+            result.push_back(proposed);
+            continue;
+        }
+
+        std::vector<double> residual(p_arr->size, 0.0);
+        double residual_sum = 0.0;
+        for (size_t k = 0; k < p_arr->size; ++k) {
+            const llama_token id = p_arr->data[k].id;
+            const double p_k = std::max(0.0, (double) p_arr->data[k].p) / p_sum;
+            const double q_k = common_sampler_prob_of(q_vec.data(), q_vec.size(), id, q_sum);
+            residual[k] = std::max(0.0, p_k - q_k);
+            residual_sum += residual[k];
+        }
+
+        llama_token id = sampled_p;
+        if (residual_sum > 1e-12) {
+            double r = std::generate_canonical<double, 53>(gsmpl->spec_rng) * residual_sum;
+            for (size_t k = 0; k < residual.size(); ++k) {
+                r -= residual[k];
+                if (r <= 0.0) {
+                    id = p_arr->data[k].id;
+                    break;
+                }
+            }
+        }
+
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+        break;
+    }
+
+    if (i == draft.size()) {
+        const llama_token id = common_sampler_sample_impl(gsmpl, ctx, idxs[i], full_grammar, false);
+        common_sampler_accept(gsmpl, id, true);
         result.push_back(id);
     }
 

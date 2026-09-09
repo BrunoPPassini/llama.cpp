@@ -1,3 +1,6 @@
+#ifndef GGML_CUDA_COMMON_CUH_INCLUDED
+#define GGML_CUDA_COMMON_CUH_INCLUDED
+
 #pragma once
 
 #include "ggml.h"
@@ -23,6 +26,7 @@
 #include "ggml-common.h"
 
 #include <array>
+#include <atomic>
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
@@ -119,6 +123,12 @@
     (CUDART_VERSION >= 12030 || (!(defined(_MSC_VER) && !defined(__clang__)) && CUDART_VERSION >= 11080))
 #    define GGML_CUDA_USE_PDL
 #endif  // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (CUDART_VERSION >= 12030 || (!(defined(_MSC_VER) && !defined(__clang__)) && CUDART_VERSION >= 11080))
+
+static __device__ __forceinline__ void ggml_cuda_syncwarp() {
+#ifndef GGML_USE_HIP
+    __syncwarp();
+#endif // GGML_USE_HIP
+}
 
 static __device__ __forceinline__ void ggml_cuda_pdl_sync() {
 #if defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
@@ -1412,10 +1422,110 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// A one-entry, per-stream cache for the Q8_1 activation consumed by MMQ.
+// Dense transformer blocks commonly multiply the same F32 activation by the
+// gate and up matrices back-to-back.  Quantizing it twice is redundant.  The
+// cache is deliberately guarded by a monotonically increasing CUDA-node
+// serial so it can only be reused by the immediately following compute node.
+struct ggml_cuda_mmq_q8_1_cache {
+    void * data = nullptr;
+    size_t capacity = 0;
+    const void * src1_data = nullptr;
+    enum ggml_type type_x = GGML_TYPE_COUNT;
+    int64_t ne10 = 0;
+    int64_t ne11 = 0;
+    int64_t ne12 = 0;
+    int64_t ne13 = 0;
+    int64_t s11 = 0;
+    int64_t s12 = 0;
+    int64_t s13 = 0;
+    int64_t ne10_padded = 0;
+    uint64_t node_serial = 0;
+    bool valid = false;
+};
+
+// Optional prefill-only hand-off from a split F32 SWIGLU node to the
+// immediately following Q6_K FFN-down MMQ.  The consumer can form the exact
+// Q8_1 activation directly from the gate/up inputs, avoiding the otherwise
+// redundant F32 SWIGLU store and reload.  This is deliberately per-stream and
+// pointer-matched; decode and unrelated GLU nodes keep the normal path.
+struct ggml_cuda_swiglu_q8_1_candidate {
+    const void * dst_data = nullptr;
+    const float * x = nullptr;
+    const float * g = nullptr;
+    int64_t ne00 = 0;
+    int64_t ne01 = 0;
+    int64_t ne02 = 0;
+    int64_t ne03 = 0;
+    int64_t x_s01 = 0;
+    int64_t x_s02 = 0;
+    int64_t x_s03 = 0;
+    int64_t g_s01 = 0;
+    int64_t g_s02 = 0;
+    int64_t g_s03 = 0;
+    bool valid = false;
+};
+
+// Generation shared by all CUDA compute contexts on a device.  KV tensor
+// virtual addresses intentionally remain stable across sparse-ring resets, so a
+// pointer-only cache key cannot distinguish old bytes from rebuilt bytes.
+// Destructive KV edits bump this epoch through the CUDA backend registry.
+inline std::atomic<uint64_t> & ggml_cuda_ring_mma_layer_cache_epoch_counter(int device) {
+    static std::array<std::atomic<uint64_t>, GGML_CUDA_MAX_DEVICES> epochs{};
+    GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
+    return epochs[device];
+}
+
+inline uint64_t ggml_cuda_ring_mma_layer_cache_epoch(int device) {
+    return ggml_cuda_ring_mma_layer_cache_epoch_counter(device).load(std::memory_order_acquire);
+}
+
+inline void ggml_cuda_ring_mma_layer_cache_invalidate(int device) {
+    ggml_cuda_ring_mma_layer_cache_epoch_counter(device).fetch_add(1, std::memory_order_acq_rel);
+}
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+    cudaStream_t host_copy_stream = nullptr;
+    cudaEvent_t host_copy_event = nullptr;
+
+    // Optional pipelined producer for the long-context MMA KV ring.  The
+    // two-stage mode prepares tile N+1 while the main stream consumes N.  The
+    // three-stage mode additionally lets the copy engine fetch N+2 while the
+    // stage stream dequantizes N+1. Events make ownership explicit and keep
+    // the slots safe across consecutive graph executions.
+    static constexpr int ring_mma_pipeline_slots_max = 3;
+    cudaStream_t ring_mma_copy_stream = nullptr;
+    cudaStream_t ring_mma_stage_stream = nullptr;
+    cudaEvent_t ring_mma_fork_event = nullptr;
+    cudaEvent_t ring_mma_copy_ready_events[ring_mma_pipeline_slots_max] = { nullptr, nullptr, nullptr };
+    cudaEvent_t ring_mma_ready_events[ring_mma_pipeline_slots_max] = { nullptr, nullptr, nullptr };
+    cudaEvent_t ring_mma_consumed_events[ring_mma_pipeline_slots_max] = { nullptr, nullptr, nullptr };
+
+    // Transfer quantized KV in larger PCIe rounds while retaining the
+    // established 8K arithmetic/online-softmax partitioning.
+    static constexpr int ring_mma_bulk_slots = 2;
+    cudaEvent_t ring_mma_bulk_ready_events[ring_mma_bulk_slots] = { nullptr, nullptr };
+    cudaEvent_t ring_mma_bulk_consumed_events[ring_mma_bulk_slots] = { nullptr, nullptr };
+
+    // Experimental layer-major prefill cache.  While consecutive graphs work
+    // on the same attention layer, retain that layer's host-backed q4 KV tail
+    // in one compact device allocation and append only newly produced rows.
+    // The cache is keyed by the stable K/V tensor addresses and is never used
+    // by decode or by the established ubatch-major path.
+    void * ring_mma_layer_cache_k = nullptr;
+    void * ring_mma_layer_cache_v = nullptr;
+    size_t ring_mma_layer_cache_k_capacity = 0;
+    size_t ring_mma_layer_cache_v_capacity = 0;
+    size_t ring_mma_layer_cache_rows = 0;
+    size_t ring_mma_layer_cache_hot_prefix = 0;
+    size_t ring_mma_layer_cache_k_stride = 0;
+    size_t ring_mma_layer_cache_v_stride = 0;
+    uint64_t ring_mma_layer_cache_epoch = 0;
+    const void * ring_mma_layer_cache_k_key = nullptr;
+    const void * ring_mma_layer_cache_v_key = nullptr;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
@@ -1423,6 +1533,23 @@ struct ggml_backend_cuda_context {
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {0};
 
     int curr_stream_no = 0;
+
+    uint64_t mmq_node_serial = 0;
+    ggml_cuda_mmq_q8_1_cache mmq_q8_1_cache[GGML_CUDA_MAX_STREAMS];
+    ggml_cuda_swiglu_q8_1_candidate swiglu_q8_1_candidate[GGML_CUDA_MAX_STREAMS];
+    // Old allocations cannot be released immediately because an already
+    // captured CUDA graph may still reference their stable device address.
+    std::vector<void *> mmq_q8_1_retired;
+
+    // Optional exact FFN branch overlap for graphs split by a staged host
+    // gate weight.  The gate projection runs on stream 1 while the independent
+    // up projection starts on stream 0.  The main stream waits only when a
+    // node directly consumes the gate result (normally SWIGLU).
+    cudaEvent_t ffn_parallel_fork_event = nullptr;
+    cudaEvent_t ffn_parallel_done_event = nullptr;
+    const ggml_tensor * ffn_parallel_output = nullptr;
+    bool ffn_parallel_pending = false;
+    bool ffn_parallel_record_aux_event = false;
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
@@ -1479,6 +1606,21 @@ struct ggml_backend_cuda_context {
     explicit ggml_backend_cuda_context(int device) :
         device(device),
         name(GGML_CUDA_NAME + std::to_string(device)) {
+        ring_mma_layer_cache_epoch = ggml_cuda_ring_mma_layer_cache_epoch(device);
+        if (const char * value = std::getenv("LLAMA_KV_HOST_RING_MMA_LAYER_CACHE_MIB")) {
+            char * end = nullptr;
+            const unsigned long requested = std::strtoul(value, &end, 10);
+            if (end != value && *end == '\0' && requested >= 2) {
+                ggml_cuda_set_device(device);
+                const size_t each = (size_t) requested * 1024 * 1024 / 2;
+                CUDA_CHECK(cudaMalloc(&ring_mma_layer_cache_k, each));
+                CUDA_CHECK(cudaMalloc(&ring_mma_layer_cache_v, each));
+                ring_mma_layer_cache_k_capacity = each;
+                ring_mma_layer_cache_v_capacity = each;
+                GGML_LOG_INFO("CUDA%d: reserved %lu MiB for layer-major q4 KV cache\n",
+                        device, requested);
+            }
+        }
     }
 
     ggml_cuda_stream_context concurrent_stream_context;
@@ -1507,6 +1649,22 @@ struct ggml_backend_cuda_context {
             if (cublas_workspace_sizes[device] == 0) {
                 const int cc = ggml_cuda_info().devices[device].cc;
                 cublas_workspace_sizes[device] = (cc >= GGML_CUDA_CC_HOPPER) ? 32 * 1024 * 1024 : 4 * 1024 * 1024;
+
+                // Blackwell defaults to 32 MiB per CUDA stream.  With up to
+                // eight concurrent streams this late, lazy allocation can
+                // consume 256 MiB and OOM an otherwise valid 16 GiB model
+                // placement on the first real prompt.  Permit an explicit
+                // per-stream cap while retaining the upstream default when
+                // the environment variable is absent.
+                if (const char * value = std::getenv("LLAMA_CUBLAS_WORKSPACE_MIB")) {
+                    char * end = nullptr;
+                    const unsigned long requested = std::strtoul(value, &end, 10);
+                    if (end != value && *end == '\0' && requested > 0) {
+                        cublas_workspace_sizes[device] = (size_t) requested * 1024 * 1024;
+                        GGML_LOG_INFO("CUDA%d: cuBLAS workspace capped at %lu MiB per stream\n",
+                                device, requested);
+                    }
+                }
             }
             CUDA_CHECK(cudaMalloc(&cublas_workspaces[device][curr_stream_no], cublas_workspace_sizes[device]));
             CUBLAS_CHECK(cublasSetWorkspace(cublas_handles[device][curr_stream_no], cublas_workspaces[device][curr_stream_no], cublas_workspace_sizes[device]));
@@ -1674,3 +1832,4 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     CUDA_CHECK(cudaGetLastError());
 }
 
+#endif // GGML_CUDA_COMMON_CUH_INCLUDED

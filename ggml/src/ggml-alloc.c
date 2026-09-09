@@ -420,6 +420,36 @@ static size_t ggml_vbuffer_size(struct vbuffer * buf) {
     return size;
 }
 
+// Compute arenas can be logically sized for the worst-case graph while CUDA VMM
+// commits only the pages touched by the graph that is actually allocated.  This
+// keeps the scheduler's addresses stable (and therefore safe to share with an
+// MTP context) without paying the full-context VRAM cost at startup.
+static void ggml_vbuffer_request_sparse_compute(
+        ggml_backend_buffer_type_t buft,
+        enum ggml_backend_buffer_usage usage) {
+    if (usage != GGML_BACKEND_BUFFER_USAGE_COMPUTE || getenv("LLAMA_COMPUTE_SPARSE_VMM") == NULL) {
+        return;
+    }
+
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (dev == NULL) {
+        return;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == NULL) {
+        return;
+    }
+
+    typedef bool (*set_next_sparse_fn)(ggml_backend_buffer_type_t);
+    set_next_sparse_fn set_next_sparse = (set_next_sparse_fn)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_next_sparse_compute_alloc");
+    if (set_next_sparse != NULL && set_next_sparse(buft)) {
+        GGML_LOG_DEBUG("%s: requesting sparse VMM compute chunk from %s\n",
+                __func__, ggml_backend_buft_name(buft));
+    }
+}
+
 static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, const struct ggml_dyn_tallocr * talloc, enum ggml_backend_buffer_usage usage) {
     struct vbuffer * buf = (struct vbuffer *)calloc(1, sizeof(struct vbuffer));
     if (buf == NULL) {
@@ -428,6 +458,12 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
 
     for (int n = 0; n < talloc->n_chunks; n++) {
         size_t chunk_size = talloc->chunks[n]->max_size;
+        // A zero-sized allocation is handled by the generic backend without
+        // calling CUDA, so arming the thread-local sparse flag here would leak
+        // into the next unrelated CUDA allocation.
+        if (chunk_size > 0) {
+            ggml_vbuffer_request_sparse_compute(buft, usage);
+        }
         buf->chunks[n] = ggml_backend_buft_alloc_buffer(buft, chunk_size);
         if (buf->chunks[n] == NULL) {
             ggml_vbuffer_free(buf);
@@ -438,15 +474,38 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
     return buf;
 }
 
-static void ggml_vbuffer_tensor_alloc(struct vbuffer * buf, struct ggml_tensor * tensor, struct buffer_address buf_addr) {
+static bool ggml_vbuffer_tensor_alloc(struct vbuffer * buf, struct ggml_tensor * tensor, struct buffer_address buf_addr) {
     void * base = ggml_backend_buffer_get_base(buf->chunks[buf_addr.chunk]);
     void * addr = (char *)base + buf_addr.offset;
-    ggml_backend_tensor_alloc(buf->chunks[buf_addr.chunk], tensor, addr);
+    return ggml_backend_tensor_alloc(buf->chunks[buf_addr.chunk], tensor, addr) == GGML_STATUS_SUCCESS;
 }
 
 static void ggml_vbuffer_reset(struct vbuffer * buf) {
     for (int i = 0; i < GGML_VBUFFER_MAX_CHUNKS && buf->chunks[i]; ++i) {
         ggml_backend_buffer_reset(buf->chunks[i]);
+    }
+}
+
+static void ggml_vbuffer_request_reset(struct vbuffer * buf) {
+    for (int i = 0; i < GGML_VBUFFER_MAX_CHUNKS && buf->chunks[i]; ++i) {
+        ggml_backend_buffer_t chunk = buf->chunks[i];
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(chunk);
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        if (dev == NULL) {
+            continue;
+        }
+
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (reg == NULL) {
+            continue;
+        }
+
+        typedef bool (*request_reset_fn)(ggml_backend_buffer_t);
+        request_reset_fn request_reset = (request_reset_fn)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_sparse_request_reset");
+        if (request_reset != NULL) {
+            (void) request_reset(chunk);
+        }
     }
 }
 
@@ -478,8 +537,15 @@ struct node_alloc {
     struct tensor_alloc src[GGML_MAX_SRC];
 };
 
+struct ggml_gallocr_shared_buffers {
+    size_t refs;
+    int n_buffers;
+    struct vbuffer ** buffers;
+};
+
 struct ggml_gallocr {
     ggml_backend_buffer_type_t * bufts; // [n_buffers]
+    struct ggml_gallocr_shared_buffers * shared_buffers;
     struct vbuffer ** buffers; // [n_buffers]
     struct ggml_dyn_tallocr ** buf_tallocs; // [n_buffers]
     int n_buffers;
@@ -534,9 +600,37 @@ ggml_gallocr_t ggml_gallocr_new(ggml_backend_buffer_type_t buft) {
     return ggml_gallocr_new_n(&buft, 1);
 }
 
+static void ggml_gallocr_shared_buffers_unref(struct ggml_gallocr_shared_buffers * shared) {
+    GGML_ASSERT(shared != NULL && shared->refs > 0);
+    if (--shared->refs > 0) {
+        return;
+    }
+
+    for (int i = 0; i < shared->n_buffers; ++i) {
+        bool freed = false;
+        for (int j = 0; j < i; ++j) {
+            if (shared->buffers[j] == shared->buffers[i]) {
+                freed = true;
+                break;
+            }
+        }
+        if (!freed) {
+            ggml_vbuffer_free(shared->buffers[i]);
+        }
+    }
+
+    free(shared->buffers);
+    free(shared);
+}
+
 void ggml_gallocr_free(ggml_gallocr_t galloc) {
     if (galloc == NULL) {
         return;
+    }
+
+    if (galloc->shared_buffers != NULL) {
+        ggml_gallocr_shared_buffers_unref(galloc->shared_buffers);
+        galloc->buffers = NULL;
     }
 
     for (int i = 0; i < galloc->n_buffers; i++) {
@@ -576,6 +670,40 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     free(galloc->node_allocs);
     free(galloc->leaf_allocs);
     free(galloc);
+}
+
+bool ggml_gallocr_share_buffers(ggml_gallocr_t dst, ggml_gallocr_t src) {
+    if (dst == NULL || src == NULL || dst == src ||
+        dst->n_buffers != src->n_buffers || dst->shared_buffers != NULL) {
+        return false;
+    }
+
+    for (int i = 0; i < dst->n_buffers; ++i) {
+        if (dst->bufts[i] != src->bufts[i] || dst->buffers[i] != NULL || src->buffers[i] == NULL) {
+            return false;
+        }
+    }
+
+    struct ggml_gallocr_shared_buffers * shared = src->shared_buffers;
+    if (shared != NULL &&
+        (shared->n_buffers != src->n_buffers || shared->buffers != src->buffers)) {
+        return false;
+    }
+
+    if (shared == NULL) {
+        shared = calloc(1, sizeof(*shared));
+        GGML_ASSERT(shared != NULL);
+        shared->refs = 1;
+        shared->n_buffers = src->n_buffers;
+        shared->buffers = src->buffers;
+        src->shared_buffers = shared;
+    }
+
+    free(dst->buffers);
+    shared->refs++;
+    dst->shared_buffers = shared;
+    dst->buffers = shared->buffers;
+    return true;
 }
 
 typedef struct ggml_gallocr * ggml_gallocr_t;
@@ -900,6 +1028,32 @@ static bool ggml_gallocr_reserve_n_impl(
         }
     }
 
+    // Never resize storage still referenced by another gallocr. A larger reservation
+    // gets independent backing storage while the original users keep the shared arena.
+    if (galloc->shared_buffers != NULL) {
+        bool need_grow = false;
+        for (int i = 0; i < galloc->n_buffers && !need_grow; ++i) {
+            for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; ++c) {
+                const size_t current = galloc->buffers[i] ? ggml_vbuffer_chunk_size(galloc->buffers[i], c) : 0;
+                if (ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c) > current) {
+                    need_grow = true;
+                    break;
+                }
+            }
+        }
+
+        if (need_grow) {
+            GGML_LOG_DEBUG("%s: detaching shared compute buffers for a larger reservation\n", __func__);
+            struct vbuffer ** buffers = calloc(galloc->n_buffers, sizeof(*buffers));
+            GGML_ASSERT(buffers != NULL);
+
+            struct ggml_gallocr_shared_buffers * shared = galloc->shared_buffers;
+            galloc->shared_buffers = NULL;
+            galloc->buffers = buffers;
+            ggml_gallocr_shared_buffers_unref(shared);
+        }
+    }
+
     // reallocate buffers if needed
     for (int i = 0; i < galloc->n_buffers; i++) {
         // if the buffer type is used multiple times, we reuse the same buffer
@@ -966,7 +1120,7 @@ bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph *graph) {
     return ggml_gallocr_reserve_n(galloc, graph, NULL, NULL);
 }
 
-static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor * tensor, struct tensor_alloc * tensor_alloc) {
+static bool ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor * tensor, struct tensor_alloc * tensor_alloc) {
     int buffer_id = tensor_alloc->buffer_id;
     assert(tensor->data || tensor->view_src || ggml_backend_buft_get_alloc_size(galloc->bufts[buffer_id], tensor) <= tensor_alloc->size_max);
 
@@ -975,22 +1129,28 @@ static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor *
             assert(tensor_alloc->addr.offset == SIZE_MAX);
             if (tensor->view_src->buffer == NULL) {
                 // this tensor was allocated without ggml-backend
-                return;
+                return true;
             }
-            ggml_backend_view_init(tensor);
+            if (ggml_backend_view_init(tensor) != GGML_STATUS_SUCCESS) {
+                return false;
+            }
         }
     } else {
         if (tensor->data == NULL) {
             assert(tensor_alloc->addr.offset != SIZE_MAX);
             assert(ggml_backend_buft_get_alloc_size(galloc->bufts[buffer_id], tensor) <= tensor_alloc->size_max);
-            ggml_vbuffer_tensor_alloc(galloc->buffers[buffer_id], tensor, tensor_alloc->addr);
+            if (!ggml_vbuffer_tensor_alloc(galloc->buffers[buffer_id], tensor, tensor_alloc->addr)) {
+                return false;
+            }
         } else {
             if (tensor->buffer == NULL) {
                 // this tensor was allocated without ggml-backend
-                return;
+                return true;
             }
         }
     }
+
+    return true;
 }
 
 static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_tensor * node, struct tensor_alloc * talloc) {
@@ -1077,7 +1237,9 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
     for (int i = 0; i < graph->n_leafs; i++) {
         struct ggml_tensor * leaf = graph->leafs[i];
         struct leaf_alloc * leaf_alloc = &galloc->leaf_allocs[i];
-        ggml_gallocr_init_tensor(galloc, leaf, &leaf_alloc->leaf);
+        if (!ggml_gallocr_init_tensor(galloc, leaf, &leaf_alloc->leaf)) {
+            return false;
+        }
     }
     // nodes
     for (int i = 0; i < graph->n_nodes; i++) {
@@ -1088,9 +1250,13 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
             if (src == NULL) {
                 continue;
             }
-            ggml_gallocr_init_tensor(galloc, src, &node_alloc->src[j]);
+            if (!ggml_gallocr_init_tensor(galloc, src, &node_alloc->src[j])) {
+                return false;
+            }
         }
-        ggml_gallocr_init_tensor(galloc, node, &node_alloc->dst);
+        if (!ggml_gallocr_init_tensor(galloc, node, &node_alloc->dst)) {
+            return false;
+        }
     }
 
     return true;
@@ -1112,6 +1278,33 @@ size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {
     }
 
     return ggml_vbuffer_size(galloc->buffers[buffer_id]);
+}
+
+void ggml_gallocr_request_reset(ggml_gallocr_t galloc) {
+    if (galloc == NULL) {
+        return;
+    }
+
+    // Several backend indices may alias the same vbuffer. Notify each physical
+    // arena once; target/draft sharing is additionally serialized by CUDA's
+    // sparse buffer mutex.
+    for (int i = 0; i < galloc->n_buffers; ++i) {
+        struct vbuffer * buf = galloc->buffers[i];
+        if (buf == NULL) {
+            continue;
+        }
+
+        bool seen = false;
+        for (int j = 0; j < i; ++j) {
+            if (galloc->buffers[j] == buf) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) {
+            ggml_vbuffer_request_reset(buf);
+        }
+    }
 }
 
 // utils

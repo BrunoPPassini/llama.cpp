@@ -57,10 +57,12 @@ public:
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+    bool get_can_rm_attn() const override { return true; }
 
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+    bool seq_rm_attn(llama_seq_id seq_id,                            llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
@@ -70,6 +72,10 @@ public:
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+
+    void set_recurrent_transaction(bool enabled) override;
+    bool recurrent_transaction_deferred() const override;
+    bool recurrent_transaction_accept(llama_seq_id seq_id, uint32_t n_keep, ggml_backend_t backend) override;
 
     // state write/load
 
@@ -126,6 +132,10 @@ public:
 
     const llama_kv_cache_context * get_attn() const;
     const llama_memory_recurrent_context * get_recr() const;
+
+    size_t ubatch_count() const;
+    const llama_ubatch & get_ubatch(size_t index) const;
+    bool select_ubatch(size_t index);
 
 private:
     // the index of the next ubatch to process

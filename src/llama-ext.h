@@ -16,6 +16,20 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_seqs,
         uint32_t n_outputs);
 
+// Release request-scoped physical pages from sparse compute arenas while
+// retaining model weights and logical KV state.
+LLAMA_API void llama_compute_arena_request_reset(struct llama_context * ctx);
+
+// Invalidate request-scoped graph/allocation metadata without releasing the
+// physical arena. Used by a context that aliases an arena owned by another
+// context (for example native MTP sharing target compute buffers).
+LLAMA_API void llama_compute_arena_request_invalidate(struct llama_context * ctx);
+
+// Internal prompt scheduler width. Normally identical to llama_n_batch(); an
+// experimental Qwen layer-major build may aggregate several physical
+// microbatches while keeping --batch-size/--ubatch-size unchanged.
+LLAMA_API uint32_t llama_prefill_batch_size(const struct llama_context * ctx);
+
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 

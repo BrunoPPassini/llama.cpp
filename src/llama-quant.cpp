@@ -288,7 +288,27 @@ static void llama_tensor_dequantize_impl(
 
 static bool tensor_allows_quantization(const llama_model_quantize_params * params, llm_arch arch, const ggml_tensor * tensor) {
     // trivial checks first -- no string ops needed
-    if (params->only_copy)       return false;
+    if (params->only_copy) {
+        // COPY is useful for surgical requantization: preserve every tensor
+        // byte-for-byte except an explicitly requested embedding/output type.
+        // Historically only_copy returned before these overrides were checked,
+        // silently turning such commands into a full model copy.
+        const std::string name = ggml_get_name(tensor);
+        const bool explicit_output = params->output_tensor_type < GGML_TYPE_COUNT && name == "output.weight";
+        const bool explicit_embedding = params->token_embedding_type < GGML_TYPE_COUNT && name == "token_embd.weight";
+        bool explicit_tensor = false;
+        if (params->tt_overrides != nullptr) {
+            for (const llama_model_tensor_override * current = params->tt_overrides; current->pattern != nullptr; ++current) {
+                if (std::regex_search(name, std::regex(current->pattern))) {
+                    explicit_tensor = true;
+                    break;
+                }
+            }
+        }
+        if (!explicit_output && !explicit_embedding && !explicit_tensor) {
+            return false;
+        }
+    }
 
     // quantize only 2D and 3D tensors (experts)
     if (ggml_n_dims(tensor) < 2) return false;
@@ -685,6 +705,18 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
     }
     if (params->output_tensor_type < GGML_TYPE_COUNT && tm.category == tensor_category::OUTPUT) {
         return params->output_tensor_type;
+    }
+
+    // In surgical COPY mode the nominal default type is F32. Resolve explicit
+    // per-tensor overrides before the generic quantized-default branch so a
+    // requested Q-type is not accidentally expanded to F32.
+    if (params->only_copy && !qs.tensor_type_patterns.empty()) {
+        const std::string tensor_name(tensor->name);
+        for (const auto & [pattern, qtype] : qs.tensor_type_patterns) {
+            if (std::regex_search(tensor_name, pattern)) {
+                return qtype;
+            }
+        }
     }
 
     ggml_type new_type = default_type;

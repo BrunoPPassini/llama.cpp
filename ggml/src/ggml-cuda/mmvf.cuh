@@ -5,6 +5,13 @@
 void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
     const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
 
+// Dense F32 GEMM specialized for a small output width (for example the
+// 5120x48 recurrent projections used by Qwen3.8). Unlike cuBLAS this path
+// does not create a late handle/workspace after the model has filled VRAM.
+void ggml_cuda_mul_mat_thin_f32(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+
 void ggml_cuda_op_mul_mat_vec_f(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,

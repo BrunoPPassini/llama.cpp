@@ -12,10 +12,20 @@
 #include "ggml-opt.h"
 
 #include <map>
+#include <memory>
+#include <mutex>
 #include <vector>
 
 struct llama_model;
 class llama_batch_allocr;
+struct llama_context;
+
+// Compute arenas may be shared by a target and its native-MTP context. Their
+// CUDA graphs are asynchronous, so ownership must be handed off explicitly.
+struct llama_compute_buffer_share {
+    std::mutex mutex;
+    llama_context * active = nullptr;
+};
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -57,6 +67,12 @@ struct llama_context {
 
     void synchronize();
 
+    // End a server request without destroying model or KV state. This
+    // invalidates cached compute graphs and lets sparse compute arenas return
+    // cold physical pages while keeping their virtual address space stable.
+    void compute_arena_request_reset();
+    void compute_arena_request_invalidate();
+
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 
@@ -67,6 +83,7 @@ struct llama_context {
     uint32_t n_batch()   const;
     uint32_t n_ubatch()  const;
     uint32_t n_seq_max() const;
+    uint32_t prefill_batch_size() const;
 
     uint32_t n_threads()       const;
     uint32_t n_threads_batch() const;
@@ -119,6 +136,10 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
+    void set_recurrent_transaction(bool enabled);
+    bool recurrent_transaction_deferred() const;
+    bool recurrent_transaction_accept(llama_seq_id seq_id, uint32_t n_keep);
+
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -138,7 +159,10 @@ struct llama_context {
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
-                       ggml_status & ret);
+                       ggml_status & ret,
+                              bool   apply_memory = true,
+                          uint32_t   layer_start = 0,
+                          uint32_t   layer_end = 0);
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
@@ -223,7 +247,7 @@ private:
 
     // Make sure enough space is available for outputs.
     // Returns max number of outputs for which space was reserved.
-    uint32_t output_reserve(int32_t n_outputs);
+    uint32_t output_reserve(int32_t n_outputs, uint32_t n_tokens = 0);
 
     void output_reorder();
 
@@ -258,7 +282,9 @@ private:
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
+                          llm_graph_type   gtype,
+                                uint32_t   layer_start = 0,
+                                uint32_t   layer_end = 0) const;
 
     llm_graph_cb graph_get_cb() const;
 
@@ -342,6 +368,8 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+    llama_context * ctx_compute = nullptr;
+    std::shared_ptr<llama_compute_buffer_share> compute_share;
 
     bool sched_need_reserve = true;
 
@@ -365,7 +393,10 @@ private:
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
     llm_graph_result_ptr gf_res_prev;
+    llm_graph_result_ptr gf_res_prev_mtp_prefill;
     llm_graph_result_ptr gf_res_reserve;
+
+    llm_graph_result * gf_res_prev_active = nullptr;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
@@ -377,6 +408,9 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+
+    // Internal layer-major prompt window. Zero disables the experimental path.
+    uint32_t layer_major_window = 0;
 
     // perf
     mutable int64_t t_start_us  = 0;

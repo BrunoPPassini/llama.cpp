@@ -191,6 +191,105 @@ static __global__ void cpy_scalar_contiguous(const char * cx, char * cdst, const
     dst[i] = ggml_cuda_cast<dst_t>(x[i]);
 }
 
+// Qwen3.5/3.8 MTP3 keeps four overlapping convolution windows so the
+// recurrent cache can roll back to any accepted draft length.  The generic
+// graph emits one strided CPY kernel per window.  All four have identical
+// geometry, so use blockIdx.y to batch them into a single launch while
+// preserving the exact scalar load/store mapping.
+static __global__ void cpy_qwen_conv_snapshots_f32(
+        const char * src0, const char * src1, const char * src2, const char * src3,
+              char * dst0,       char * dst1,       char * dst2,       char * dst3,
+        int64_t ne, int64_t ne00, int64_t nb00, int64_t nb01) {
+    const int64_t i = (int64_t) blockDim.x * blockIdx.x + threadIdx.x;
+    if (i >= ne) {
+        return;
+    }
+
+    const char * src;
+    char * dst;
+    switch (blockIdx.y) {
+        case 0: src = src0; dst = dst0; break;
+        case 1: src = src1; dst = dst1; break;
+        case 2: src = src2; dst = dst2; break;
+        default: src = src3; dst = dst3; break;
+    }
+
+    const int64_t i01 = i / ne00;
+    const int64_t i00 = i - i01 * ne00;
+    const float value = *(const float *) (src + i00 * nb00 + i01 * nb01);
+    ((float *) dst)[i] = value;
+}
+
+// Decode-specialized version: for MTP3 the concatenated convolution row is
+// seven floats wide and the four rollback windows cover positions [1..6].
+// Load 32 complete rows contiguously, then reuse them from shared memory.
+static __global__ void cpy_qwen_conv_snapshots_tiled_f32(
+        const float * src_first,
+              float * dst0, float * dst1, float * dst2, float * dst3,
+        int64_t channels) {
+    constexpr int tile_channels = 32;
+    constexpr int row_floats    = 7;
+    __shared__ float tile[tile_channels * row_floats];
+
+    const int64_t channel_base = (int64_t) blockIdx.x * tile_channels;
+    const int64_t remaining = channels - channel_base;
+    const int valid_channels = (int) (remaining < tile_channels ? remaining : tile_channels);
+    const int load_count = valid_channels * row_floats;
+    for (int i = threadIdx.x; i < load_count; i += blockDim.x) {
+        tile[i] = src_first[channel_base * row_floats + i];
+    }
+    __syncthreads();
+
+    const int lane = threadIdx.x;
+    if (lane >= valid_channels) {
+        return;
+    }
+
+    const float * row = tile + lane * row_floats;
+    const float v0 = row[0];
+    const float v1 = row[1];
+    const float v2 = row[2];
+    const float v3 = row[3];
+    const float v4 = row[4];
+    const float v5 = row[5];
+    const int64_t out = (channel_base + lane) * 3;
+    dst0[out + 0] = v0; dst0[out + 1] = v1; dst0[out + 2] = v2;
+    dst1[out + 0] = v1; dst1[out + 1] = v2; dst1[out + 2] = v3;
+    dst2[out + 0] = v2; dst2[out + 1] = v3; dst2[out + 2] = v4;
+    dst3[out + 0] = v3; dst3[out + 1] = v4; dst3[out + 2] = v5;
+}
+
+void ggml_cuda_cpy_qwen_conv_snapshots(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * const src[4],
+              ggml_tensor * const dst[4]) {
+    const int64_t ne = ggml_nelements(src[0]);
+    constexpr int threads = 256;
+    const int64_t channels = src[0]->ne[1];
+    if (src[0]->nb[1] == 7 * sizeof(float)) {
+        constexpr int tile_channels = 32;
+        const int64_t blocks_x = (channels + tile_channels - 1) / tile_channels;
+        GGML_ASSERT(blocks_x <= INT_MAX);
+        const ggml_cuda_kernel_launch_params launch_params((dim3) blocks_x, threads, 0, ctx.stream());
+        ggml_cuda_kernel_launch(cpy_qwen_conv_snapshots_tiled_f32, launch_params,
+            (const float *) src[0]->data,
+            (float *) dst[0]->data, (float *) dst[1]->data,
+            (float *) dst[2]->data, (float *) dst[3]->data,
+            channels);
+    } else {
+        const int64_t blocks_x = (ne + threads - 1) / threads;
+        GGML_ASSERT(blocks_x <= INT_MAX);
+        const dim3 blocks((unsigned int) blocks_x, 4, 1);
+        const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
+        ggml_cuda_kernel_launch(cpy_qwen_conv_snapshots_f32, launch_params,
+            (const char *) src[0]->data, (const char *) src[1]->data,
+            (const char *) src[2]->data, (const char *) src[3]->data,
+            (char *) dst[0]->data, (char *) dst[1]->data,
+            (char *) dst[2]->data, (char *) dst[3]->data,
+            ne, src[0]->ne[0], src[0]->nb[0], src[0]->nb[1]);
+    }
+}
+
 template<typename src_t, typename dst_t>
 static void ggml_cpy_scalar_contiguous_cuda(
     const char * cx, char * cdst, const int64_t ne,
@@ -459,7 +558,8 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
 
     const bool contiguous_srcs = ggml_is_contiguous(src0) && ggml_is_contiguous(src1);
     const bool can_be_transposed = nb01 == (int64_t)ggml_element_size(src0) &&
-        src0->ne[3] == 1 && nb02 == ne00 * ne01 * (int64_t)ggml_element_size(src0);
+        src0->ne[3] == 1 && nb02 == ne00 * ne01 * (int64_t)ggml_element_size(src0) &&
+        ggml_is_contiguous(src1);
 
     size_t mc_width = 0, mc_height = 0, mc_spitch = 0, mc_dpitch = 0;
 

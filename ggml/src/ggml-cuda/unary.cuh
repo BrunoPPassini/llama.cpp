@@ -91,6 +91,17 @@ void ggml_cuda_op_xielu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
 
+// Fuses Qwen's recurrent gate chain:
+//   gate = softplus(alpha + dt_bias) * a
+// The three inputs are F32 and contiguous; dt_bias and a are broadcast over
+// the leading channel dimension.  Keeping this entry point in unary.cu makes
+// it use the exact same softplus implementation as the unfused path.
+void ggml_cuda_op_qwen_alpha_gate(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * add_node,
+        ggml_tensor * softplus_node,
+        ggml_tensor * mul_node);
+
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
 
 __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {

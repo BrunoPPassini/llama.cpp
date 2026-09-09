@@ -985,6 +985,14 @@ struct common_memory {
 
     void init(llama_context * ctx_tgt, llama_context * ctx_dft = nullptr);
 
+    // Attempts to remove a range from both target and draft memories.
+    //
+    // Unlike seq_rm(), this never aborts when a memory implementation cannot
+    // represent the requested edit (notably historical edits of recurrent or
+    // hybrid state).  Callers can then fall back to a full clear + replay,
+    // which is the only exact way to rebuild such state.
+    bool try_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
+
     // aborts execution on failure
     void seq_rm (llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
     void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const;

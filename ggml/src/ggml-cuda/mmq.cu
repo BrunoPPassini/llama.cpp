@@ -135,28 +135,134 @@ void ggml_cuda_mul_mat_q(
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
             ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
-        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+        ggml_cuda_pool_alloc<char> src1_q8_1_local(ctx.pool());
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
         if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
             src1_scale.alloc(ne13*ne12*ne11);
         }
 
-        {
-            const int64_t s11 = src1->nb[1] / ts_src1;
-            const int64_t s12 = src1->nb[2] / ts_src1;
-            const int64_t s13 = src1->nb[3] / ts_src1;
+        const int64_t src1_s11 = src1->nb[1] / ts_src1;
+        const int64_t src1_s12 = src1->nb[2] / ts_src1;
+        const int64_t src1_s13 = src1->nb[3] / ts_src1;
+
+        static const bool fuse_swiglu_q8_1 = getenv("LLAMA_CUDA_FUSE_SWIGLU_Q8_1") != nullptr;
+        ggml_cuda_swiglu_q8_1_candidate * swiglu_candidate = nullptr;
+        if (fuse_swiglu_q8_1 && (src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q4_K)) {
+            for (int stream_no = 0; stream_no < GGML_CUDA_MAX_STREAMS; ++stream_no) {
+                ggml_cuda_swiglu_q8_1_candidate & candidate = ctx.swiglu_q8_1_candidate[stream_no];
+                if (candidate.valid && candidate.dst_data == src1_d &&
+                        candidate.x_s01 == int64_t(src0->type) &&
+                        candidate.ne00 == ne10 && candidate.ne01 == ne11 &&
+                        candidate.ne02 == ne12 && candidate.ne03 == ne13) {
+                    swiglu_candidate = &candidate;
+                    break;
+                }
+            }
+        }
+        const bool use_fused_swiglu_q8_1 = swiglu_candidate != nullptr;
+        static const bool q8_1_cache_enabled = getenv("LLAMA_MMQ_Q8_1_CACHE") != nullptr;
+        const bool is_ffn_gate = strstr(dst->name, "ffn_gate-") != nullptr;
+        const bool is_ffn_up   = strstr(dst->name, "ffn_up-")   != nullptr;
+
+        // Qwen3.5/3.8 projects the same normalized activation several times:
+        //   linear-attention: qkv_mixed, z, beta, alpha
+        //   full-attention:   Q, K, V
+        // Re-quantizing that immutable F32 activation to Q8_1 for every MMQ is
+        // redundant.  Retain the exact Q8_1 bytes across each explicitly
+        // delimited projection family.  A family start always forces a fresh
+        // quantization, so compute-buffer address reuse between layers cannot
+        // produce a false cache hit.
+        const bool is_linear_qkv = strstr(dst->name, "linear_attn_qkv_mixed-") != nullptr;
+        const bool is_linear_z   = strstr(dst->name, "z-")                     != nullptr;
+        const bool is_linear_beta  = strstr(dst->name, "beta-")                != nullptr;
+        const bool is_linear_alpha = strstr(dst->name, "alpha-")               != nullptr;
+        const bool is_attn_q = strstr(dst->name, "Qcur_full-") != nullptr;
+        const bool is_attn_k = strstr(dst->name, "Kcur-")      != nullptr;
+        const bool is_attn_v = strstr(dst->name, "Vcur-")      != nullptr;
+
+        const bool cache_start = is_ffn_gate || is_linear_qkv || is_attn_q;
+        const bool cache_end   = is_ffn_up   || is_linear_alpha || is_attn_v;
+        const bool cache_candidate = q8_1_cache_enabled && !use_native_fp4 &&
+            (is_ffn_gate || is_ffn_up || is_linear_qkv || is_linear_z || is_linear_beta || is_linear_alpha ||
+             is_attn_q || is_attn_k || is_attn_v);
+        ggml_cuda_mmq_q8_1_cache * cache = cache_candidate ? &ctx.mmq_q8_1_cache[ctx.curr_stream_no] : nullptr;
+        const bool cache_hit = !cache_start && cache != nullptr && cache->valid && cache->data != nullptr &&
+            cache->src1_data == src1_d &&
+            cache->type_x == src0->type && cache->ne10 == ne10 && cache->ne11 == ne11 &&
+            cache->ne12 == ne12 && cache->ne13 == ne13 && cache->s11 == src1_s11 &&
+            cache->s12 == src1_s12 && cache->s13 == src1_s13 &&
+            cache->ne10_padded == ne10_padded && cache->capacity >= nbytes_src1_q8_1;
+
+        static const bool q8_1_cache_trace = getenv("LLAMA_MMQ_Q8_1_CACHE_TRACE") != nullptr;
+        if (q8_1_cache_trace && ne11 >= 256) {
+            static std::atomic<uint64_t> traced_hits{0};
+            const uint64_t hit = traced_hits.fetch_add(1, std::memory_order_relaxed);
+            if (hit < 128) {
+                fprintf(stderr, "MMQ_Q8_1_CACHE: hit=%d start=%d end=%d name=%s type=%s stream=%d serial=%llu src=%p ne=[%lld,%lld,%lld,%lld] bytes=%zu\n",
+                    cache_hit ? 1 : 0, cache_start ? 1 : 0, cache_end ? 1 : 0, dst->name, ggml_type_name(src0->type),
+                    ctx.curr_stream_no, (unsigned long long) ctx.mmq_node_serial, src1_d,
+                    (long long) ne10, (long long) ne11, (long long) ne12, (long long) ne13,
+                    nbytes_src1_q8_1);
+                fflush(stderr);
+            }
+        }
+
+        char * src1_q8_1 = nullptr;
+        if (use_fused_swiglu_q8_1) {
+            src1_q8_1 = (char *) swiglu_candidate->x;
+            swiglu_candidate->valid = false;
+        } else if (cache != nullptr) {
+            if (cache->capacity < nbytes_src1_q8_1) {
+                void * replacement = nullptr;
+                ggml_cuda_set_device(ctx.device);
+                const size_t allocation_size = ((nbytes_src1_q8_1 + nbytes_src1_q8_1/10 + 255)/256)*256;
+                CUDA_CHECK(cudaMalloc(&replacement, allocation_size));
+                if (cache->data != nullptr) {
+                    ctx.mmq_q8_1_retired.push_back(cache->data);
+                }
+                cache->data = replacement;
+                cache->capacity = allocation_size;
+                cache->valid = false;
+            }
+            src1_q8_1 = (char *) cache->data;
+        } else {
+            src1_q8_1 = src1_q8_1_local.alloc(nbytes_src1_q8_1);
+        }
+
+        if (!cache_hit && !use_fused_swiglu_q8_1) {
             if (use_native_fp4) {
                 static constexpr size_t align_float8 = 32;
                 const bool use_aligned_float8 = ggml_cuda_is_aligned(src1, align_float8);
                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
-                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1, src1_scale.ptr, src0->type, use_aligned_float8, ne10, src1_s11, src1_s12, src1_s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
 
             } else {
-                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1, src0->type, ne10, src1_s11, src1_s12, src1_s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
             }
             CUDA_CHECK(cudaGetLastError());
+
+        }
+
+        if (cache != nullptr && !cache_end) {
+            cache->src1_data = src1_d;
+            cache->type_x = src0->type;
+            cache->ne10 = ne10;
+            cache->ne11 = ne11;
+            cache->ne12 = ne12;
+            cache->ne13 = ne13;
+            cache->s11 = src1_s11;
+            cache->s12 = src1_s12;
+            cache->s13 = src1_s13;
+            cache->ne10_padded = ne10_padded;
+            cache->node_serial = ctx.mmq_node_serial;
+            cache->valid = true;
+        } else if (cache != nullptr) {
+            // Never carry an activation past the explicitly delimited
+            // projection family. This also prevents address-reuse hits in the
+            // next transformer layer.
+            cache->valid = false;
         }
 
         // Stride depends on quantization format
@@ -166,7 +272,7 @@ void ggml_cuda_mul_mat_q(
         const int64_t s13 = ne12*s12;
 
         const mmq_args args = {
-            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
+            src0_d, src0->type, (const int *) src1_q8_1, nullptr, nullptr, dst_d,
             src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,

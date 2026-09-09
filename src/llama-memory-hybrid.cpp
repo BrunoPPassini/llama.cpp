@@ -131,8 +131,11 @@ llama_memory_context_ptr llama_memory_hybrid::init_update(llama_context * lctx, 
 }
 
 bool llama_memory_hybrid::get_can_shift() const {
-    // Shifting is trivially supported for recurrent
-    return mem_attn->get_can_shift();
+    // The attention cache can be shifted, but the recurrent half represents
+    // the complete history as one aggregate state.  A historical edit must be
+    // rebuilt by replay; advertising generic shift support silently leaves
+    // attention KV and recurrent state describing different sequences.
+    return false;
 }
 
 void llama_memory_hybrid::clear(bool data) {
@@ -146,6 +149,13 @@ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
     if (!mem_recr->seq_rm(seq_id, p0, p1)) {
         return false;
     }
+    return mem_attn->seq_rm(seq_id, p0, p1);
+}
+
+bool llama_memory_hybrid::seq_rm_attn(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    // Used after restoring an exact recurrent checkpoint. The checkpoint owns
+    // the recurrent state at p0; only stale attention KV after that boundary
+    // must be discarded.
     return mem_attn->seq_rm(seq_id, p0, p1);
 }
 
@@ -185,6 +195,18 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdo
         mb[buft_size.first] += buft_size.second;
     }
     return mb;
+}
+
+void llama_memory_hybrid::set_recurrent_transaction(bool enabled) {
+    mem_recr->set_recurrent_transaction(enabled);
+}
+
+bool llama_memory_hybrid::recurrent_transaction_deferred() const {
+    return mem_recr->recurrent_transaction_deferred();
+}
+
+bool llama_memory_hybrid::recurrent_transaction_accept(llama_seq_id seq_id, uint32_t n_keep, ggml_backend_t backend) {
+    return mem_recr->recurrent_transaction_accept(seq_id, n_keep, backend);
 }
 
 void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
@@ -276,4 +298,28 @@ const llama_kv_cache_context * llama_memory_hybrid_context::get_attn() const {
 
 const llama_memory_recurrent_context * llama_memory_hybrid_context::get_recr() const {
     return static_cast<const llama_memory_recurrent_context *>(ctx_recr.get());
+}
+
+size_t llama_memory_hybrid_context::ubatch_count() const {
+    return ubatches.size();
+}
+
+const llama_ubatch & llama_memory_hybrid_context::get_ubatch(size_t index) const {
+    GGML_ASSERT(index < ubatches.size());
+    return ubatches[index];
+}
+
+bool llama_memory_hybrid_context::select_ubatch(size_t index) {
+    if (index >= ubatches.size()) {
+        return false;
+    }
+
+    auto * attn = static_cast<llama_kv_cache_context *>(ctx_attn.get());
+    auto * recr = static_cast<llama_memory_recurrent_context *>(ctx_recr.get());
+    if (!attn->select_ubatch(index) || !recr->select_ubatch(index)) {
+        return false;
+    }
+
+    i_next = index;
+    return true;
 }
