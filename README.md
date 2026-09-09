@@ -111,6 +111,11 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 - [Qwen3.8-27B / RTX 5070 Ti hot-cold KV engineering study](docs/LOCAL-QWEN-BLACKWELL-STUDY.md)
 - [Complete Qwen3.8 Blackwell 256K source branch](https://github.com/BrunoPPassini/llama.cpp/tree/qwen38-blackwell-256k)
 
+The custom runtime was validated only with the documented Qwen3.8-27B
+UD-IQ4_XS artifact on an RTX 5070 Ti 16 GB. RTX 5060 Ti 16 GB and RTX 5080
+16 GB are plausible Blackwell ports but are not measured configurations; other
+models and quantizations require independent validation.
+
 ## Contributing
 
 - Contributors can open PRs
