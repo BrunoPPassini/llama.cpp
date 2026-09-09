@@ -35,6 +35,20 @@ NVIDIA GeForce RTX 5070 Ti, driver 591.86, 16303 MiB,
 PCIe max Gen5 x16, current Gen5 x16
 ```
 
+## Hardware and model compatibility scope
+
+This runtime was developed, profiled, and quality-gated only with the exact `Qwen3.8-27B-UD-IQ4_XS.gguf` artifact identified below on an RTX 5070 Ti 16 GB. It is not a generic Qwen runtime and it is not validated for other model families, Qwen sizes, quantizations, tensor layouts, MTP heads, or chat templates. A different model may reject the specialized path, fall back to ordinary kernels, fail its memory fit, or produce incorrect behavior if a model-specific invariant is accidentally violated. Treat every other model as unsupported until its tensor shapes, state layout, token behavior, and executable quality suite pass independently.
+
+The source was compiled for CUDA target `120a-real`. Two other 16 GB Blackwell cards are plausible ports, but are not measured results from this study:
+
+| GPU | Why it is a candidate | Expected limitation | Validation status |
+|---|---|---|---|
+| RTX 5070 Ti 16 GB | Development machine; 16 GB GDDR7 and PCIe 5.0 x16 | Display and driver reservations leave less than the nominal 16 GB available | Tested |
+| RTX 5080 16 GB | Same Blackwell generation, 16 GB capacity, and a higher compute/bandwidth ceiling | Exact VRAM margin and scheduling still require a fresh build and benchmark | Not tested |
+| RTX 5060 Ti 16 GB | Blackwell architecture and the same nominal memory capacity | Substantially lower memory bandwidth means the profile may fit but should be slower | Not tested |
+
+The 8 GB RTX 5060 Ti is not a candidate for this exact all-weights-resident profile. Even on the 16 GB cards, do not copy measured RTX 5070 Ti throughput into a compatibility claim: rebuild for the installed GPU, verify that every intended layer remains on device, record usable VRAM after display allocation, and rerun token-identity plus repository tests.
+
 ## Frozen model and runtime identity
 
 | Artifact | Size | SHA-256 |
@@ -302,6 +316,34 @@ Internal graph timing provided the model-level complement: recurrent blocks acco
 | Fused GDN normalization | Changes model math and required separate quality proof | Disabled; reference GDN retained |
 
 The rejected list is important. The final number is not the maximum from a pile of cherry-picked runs. Improvements entered the frozen profile only when the mechanism, output behavior, memory effect, and repeatability agreed.
+
+## Target and draft KV precision: Q4_0 versus Q8_0
+
+Q8 KV was tested in both the target and native-MTP draft caches. It was not promoted. This was a runtime precision experiment, not a model-weight quantization change: the UD-IQ4_XS weights, chat template, sampler, and logical 262,144-token window remained fixed.
+
+| Workload | Q4_0 target/draft KV | Q8_0 target/draft KV | Q8 effect |
+|---|---:|---:|---:|
+| 4,213 input + 512 output, 65,536 hot, three restarts | 1,707.05 pp/s, 105.22 tg/s, 7.339 s wall | 1,707.53 pp/s, 100.24 tg/s, 7.579 s wall | +0.03% pp, -4.74% tg, +3.27% wall |
+| 100,116 input + 1,024 output, 32,768 hot | 1,062.37 pp/s, 49.93 tg/s, 114.766 s wall | 905.00 pp/s, 38.44 tg/s, 137.296 s wall | -14.81% pp, -23.00% tg, +19.63% wall |
+
+The short Q4 group peaked at 14,340 MiB and the short Q8 group at 14,544 MiB. For the long same-hot comparison, Q4 peaked at 15,138 MiB and Q8 at 15,730 MiB. Q8 carries 88.89% more KV payload bytes in this layout. The long Q8 value is the mean of two repetitions (38.43 and 38.45 tg/s); the long Q4 control was measured once in this phase.
+
+Q8 was numerically more faithful in a synthetic attention test: quantization-only relative L2 error fell from 0.120951 for Q4 to 0.00753238 for Q8, about 16.06x lower. That is a tensor-fidelity result, not an intelligence or pass@1 score. All four newly collected long outputs had identical 1,024 token IDs across Q4 and Q8, and no agentic-quality gain was demonstrated. The correct conclusion is therefore that no practical quality improvement was observed in this study, not that Q8 can never change or improve an output.
+
+The measured speed penalty is implementation-specific. This runtime has a fused Q4 dequantization path, while Q8 used the generic path; no equivalent fused Q8 kernel was implemented. Q8 with a 65,536-token hot set was measured only on the short prompt. The long Q8 run used 32,768 hot tokens by design, so this study does not claim that Q8 hot-64K produced an OOM. Given the clear long-context cost and absent demonstrated quality benefit, the frozen profile retains Q4_0 for target and draft KV.
+
+## Thinking and multi-turn preservation
+
+The frozen agent profile does not disable reasoning. It enables model reasoning with `--reasoning on`, parses it with `--reasoning-format deepseek`, and enables history preservation with `--reasoning-preserve`. The Unsloth template is also invoked with `enable_thinking=true` and `preserve_thinking=true`.
+
+These controls solve two separate problems:
+
+1. `enable_thinking` allows the model to generate its reasoning trace.
+2. `preserve_reasoning`/`preserve_thinking` keeps earlier assistant reasoning in the serialized multi-turn history after a tool result is appended, rather than preserving only the last assistant turn.
+
+The second point matters for an agent. Without preservation, the model can call a tool and then resume without the hypothesis, plan, or interpretation that motivated the call. With preservation, the next turn receives that state and can continue the same investigation. Preservation does not require displaying the trace in the terminal or final answer: a harness can hide reasoning from the user while retaining it in the request history sent back to the model.
+
+This is a chat-template and harness correctness requirement, not a claim that longer visible thinking automatically improves every answer. It also consumes context, so the harness still needs compact tool results and controlled compaction. The repository benchmark below used preserved reasoning for both harnesses. A clean isolated pass@1 claim for preservation alone was not established; the quality gates support the complete frozen stack, including the template and preservation settings.
 
 ## Agent harness result: Pi versus Codex
 

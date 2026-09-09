@@ -38,6 +38,12 @@ The default is one slot, a 262,144-token logical context, a 65,536-token device
 prefix, Q4_0 KV for main and draft caches, MTP3, and 32 context checkpoints.
 Override `-Context`, `-Port`, or `-Server` when needed.
 
+Reasoning is enabled and preserved across tool turns by the launcher. The trace
+may be hidden by the client UI, but it remains in the serialized history so the
+model can continue the hypothesis and plan that led to a tool call. Removing
+`--reasoning-preserve` or the template preservation kwargs changes agent behavior
+and is not the published profile.
+
 Important operational constraints:
 
 - Start only one model server. A second process invalidates the VRAM fit.
@@ -45,6 +51,11 @@ Important operational constraints:
   exact attention and therefore has O(context) decode cost.
 - The published measurements used Qwen3.8-27B UD-IQ4_XS. Other models and
   quantizations need independent validation.
+- RTX 5060 Ti 16 GB and RTX 5080 16 GB are plausible Blackwell targets, not
+  measured configurations. The 8 GB RTX 5060 Ti cannot fit this exact profile.
+- Q8_0 target/draft KV was tested but not promoted: it used more VRAM, slowed the
+  long same-hot workload, and showed no practical quality gain in the measured
+  long outputs. The frozen launcher intentionally uses Q4_0 KV.
 - The visual projector and Web UI are disabled in the frozen profile.
 - Environment switches are experimental. The ordinary path remains available by
   clearing them and using normal `llama-server` arguments.
