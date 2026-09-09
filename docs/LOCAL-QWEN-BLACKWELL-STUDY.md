@@ -447,7 +447,7 @@ LLAMA_KV_HOST_RING_MMA_PREFILL_PIPELINE=1
 LLAMA_KV_HOST_RING_MMA_TRIPLE_PIPELINE=1
 LLAMA_KV_HOST_RING_MMA_FUSED_Q4_DEQUANT=1
 LLAMA_KV_HOST_RING_MMA_Q4_NARROW_BLOCK=1
-LLAMA_KV_HOST_RING_MMA_PREFILL_FSM=1
+LLAMA_KV_HOST_RING_MMA_PREFILL_FSM=0
 LLAMA_KV_HOST_RING_MMA_INLINE_Q4=0
 
 LLAMA_RS_TRANSACTION_LOG=1
@@ -464,7 +464,7 @@ LLAMA_KV_HOST_RING_MMA_LAYER_CACHE_MIB=0
 LLAMA_DISABLE_FUSED_GDN_CH=1
 ```
 
-Some enabled flags are correctness plumbing or no-op experimental scaffolding rather than measured speedups. In particular, the prefill FSM was functionally validated but measured neutral, and direct inline Q4 is off.
+Some enabled flags are correctness plumbing or no-op experimental scaffolding rather than measured speedups. In particular, direct inline Q4 is off. The prefill FSM is also off: it measured neutral and a later 87K Windows/WDDM run exceeded the display-driver watchdog while the persistent kernel was active. Disabling it does not change model arithmetic or quantization.
 
 ## Build configuration actually used
 

@@ -53,7 +53,9 @@ $runtimeEnvironment = [ordered]@{
     LLAMA_KV_HOST_RING_MMA_TRIPLE_PIPELINE       = "1"
     LLAMA_KV_HOST_RING_MMA_FUSED_Q4_DEQUANT      = "1"
     LLAMA_KV_HOST_RING_MMA_Q4_NARROW_BLOCK       = "1"
-    LLAMA_KV_HOST_RING_MMA_PREFILL_FSM           = "1"
+    # The persistent prefill kernel has no material throughput gain on WDDM
+    # and can exceed the Windows watchdog interval on long prompts.
+    LLAMA_KV_HOST_RING_MMA_PREFILL_FSM           = "0"
     LLAMA_KV_HOST_RING_MMA_INLINE_Q4             = "0"
     LLAMA_RS_TRANSACTION_LOG                     = "1"
     LLAMA_RS_PHASE_ARENA                         = "1"
