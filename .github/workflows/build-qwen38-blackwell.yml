@@ -19,6 +19,7 @@ on:
           - ring-256k
 
 permissions:
+  actions: write
   contents: read
 
 concurrency:
@@ -35,6 +36,11 @@ jobs:
         uses: actions/checkout@v6
         with:
           ref: ${{ inputs.source_ref }}
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: qwen38-blackwell-windows-cuda-13.3-sm120
 
       - name: Install CUDA 13.3
         uses: ./.github/actions/windows-setup-cuda
@@ -75,12 +81,47 @@ jobs:
           if (-not (Test-Path -LiteralPath $server -PathType Leaf)) {
               throw "Custom server was not produced: $server"
           }
-          $help = & $server --help 2>&1 | Out-String
-          foreach ($requiredOption in @("--ctx-checkpoints", "--spec-type", "--reasoning-preserve")) {
-              if ($help -notmatch [regex]::Escape($requiredOption)) {
-                  throw "Required option missing from built server: $requiredOption"
+          if ((Get-Item -LiteralPath $server).Length -le 0) {
+              throw "Custom server is empty: $server"
+          }
+
+          $header = [System.IO.File]::ReadAllBytes($server)
+          if ($header.Length -lt 2 -or $header[0] -ne 0x4d -or $header[1] -ne 0x5a) {
+              throw "Custom server is not a valid Windows PE file: $server"
+          }
+
+          $runtimeDirectory = Split-Path -Parent $server
+          $requiredDlls = @(
+              "ggml-base.dll",
+              "ggml-cpu.dll",
+              "ggml-cuda.dll",
+              "ggml.dll",
+              "llama-common.dll",
+              "llama-server-impl.dll",
+              "llama.dll",
+              "mtmd.dll"
+          )
+          foreach ($requiredDll in $requiredDlls) {
+              $dll = Join-Path $runtimeDirectory $requiredDll
+              if (-not (Test-Path -LiteralPath $dll -PathType Leaf)) {
+                  throw "Required runtime DLL was not produced: $dll"
               }
           }
+
+          $argumentSource = Get-Content -LiteralPath "common\arg.cpp" -Raw
+          foreach ($requiredOption in @("--ctx-checkpoints", "--spec-type", "--reasoning-preserve")) {
+              if ($argumentSource -notmatch [regex]::Escape($requiredOption)) {
+                  throw "Required option missing from compiled source: $requiredOption"
+              }
+              Write-Host "validated option: $requiredOption"
+          }
+
+          Get-ChildItem -LiteralPath $runtimeDirectory -File |
+              Sort-Object Name |
+              ForEach-Object {
+                  $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                  Write-Host "$hash  $($_.Name)"
+              }
 
       - name: Assemble profile packages
         shell: pwsh
