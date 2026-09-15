@@ -75,12 +75,56 @@ jobs:
           if (-not (Test-Path -LiteralPath $server -PathType Leaf)) {
               throw "Custom server was not produced: $server"
           }
-          $help = & $server --help 2>&1 | Out-String
+          if ((Get-Item -LiteralPath $server).Length -le 0) {
+              throw "Custom server is empty: $server"
+          }
+
+          $runtimeDirectory = Split-Path -Parent $server
+          foreach ($requiredDll in @("ggml-cuda.dll", "llama.dll", "llama-server-impl.dll")) {
+              $dll = Join-Path $runtimeDirectory $requiredDll
+              if (-not (Test-Path -LiteralPath $dll -PathType Leaf)) {
+                  throw "Required runtime DLL was not produced: $dll"
+              }
+          }
+
+          $validationDirectory = "build-blackwell\validation"
+          New-Item -ItemType Directory -Force $validationDirectory | Out-Null
+          $stdoutPath = Join-Path $validationDirectory "server-help.stdout.txt"
+          $stderrPath = Join-Path $validationDirectory "server-help.stderr.txt"
+          $process = Start-Process `
+              -FilePath $server `
+              -ArgumentList "--help" `
+              -NoNewWindow `
+              -Wait `
+              -PassThru `
+              -RedirectStandardOutput $stdoutPath `
+              -RedirectStandardError $stderrPath
+
+          $help = (
+              (Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue) +
+              (Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue)
+          )
+          Write-Host "server --help exit code: $($process.ExitCode)"
+          Write-Host "server --help captured characters: $($help.Length)"
+          if ($process.ExitCode -ne 0) {
+              throw "Built server --help exited with code $($process.ExitCode)"
+          }
+
           foreach ($requiredOption in @("--ctx-checkpoints", "--spec-type", "--reasoning-preserve")) {
               if ($help -notmatch [regex]::Escape($requiredOption)) {
                   throw "Required option missing from built server: $requiredOption"
               }
+              Write-Host "validated option: $requiredOption"
           }
+
+      - name: Upload validation diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: qwen38-blackwell-validation-diagnostics
+          path: build-blackwell/validation
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Assemble profile packages
         shell: pwsh
