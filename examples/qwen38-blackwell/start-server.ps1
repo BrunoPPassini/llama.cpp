@@ -8,18 +8,38 @@ param(
 
     [string] $Server,
     [int] $Port = 18752,
-    [int] $Context = 262144
+    [ValidateSet("hot-88k", "ring-256k")]
+    [string] $Profile = "ring-256k"
 )
 
 $ErrorActionPreference = "Stop"
 
 if ([string]::IsNullOrWhiteSpace($Server)) {
-    $Server = Join-Path $PSScriptRoot "..\..\build-blackwell\bin\Release\llama-server-mtpctx.exe"
+    $packagedServer = Join-Path $PSScriptRoot "llama-server-mtpctx.exe"
+    if (Test-Path -LiteralPath $packagedServer -PathType Leaf) {
+        $Server = $packagedServer
+    } else {
+        $Server = Join-Path $PSScriptRoot "..\..\build-blackwell\bin\Release\llama-server-mtpctx.exe"
+    }
 }
 
 $serverPath = [System.IO.Path]::GetFullPath($Server)
 $modelPath = [System.IO.Path]::GetFullPath($Model)
 $templatePath = [System.IO.Path]::GetFullPath($ChatTemplate)
+
+$profileConfig = if ($Profile -eq "hot-88k") {
+    [ordered]@{
+        Context     = 88064
+        HotTokens   = 88064
+        Checkpoints = 8
+    }
+} else {
+    [ordered]@{
+        Context     = 262144
+        HotTokens   = 65536
+        Checkpoints = 32
+    }
+}
 
 foreach ($requiredPath in @($serverPath, $modelPath, $templatePath)) {
     if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
@@ -37,8 +57,8 @@ $runtimeEnvironment = [ordered]@{
     LLAMA_KV_SPARSE_CHUNK_TOKENS                 = "4096"
     LLAMA_KV_SPARSE_PREFETCH_TOKENS              = "4096"
     LLAMA_KV_SPARSE_HOST_FALLBACK                = "1"
-    LLAMA_KV_SPARSE_DEVICE_PREFIX_TOKENS         = "65536"
-    LLAMA_KV_RESERVE_TOKENS                      = "65536"
+    LLAMA_KV_SPARSE_DEVICE_PREFIX_TOKENS         = [string] $profileConfig.HotTokens
+    LLAMA_KV_RESERVE_TOKENS                      = [string] $profileConfig.HotTokens
     LLAMA_KV_HOST_STAGE_COLD_FA                  = "1"
     LLAMA_KV_HOST_RING_FA                        = "1"
     LLAMA_KV_HOST_RING_FORCE_VEC                 = "0"
@@ -53,9 +73,7 @@ $runtimeEnvironment = [ordered]@{
     LLAMA_KV_HOST_RING_MMA_TRIPLE_PIPELINE       = "1"
     LLAMA_KV_HOST_RING_MMA_FUSED_Q4_DEQUANT      = "1"
     LLAMA_KV_HOST_RING_MMA_Q4_NARROW_BLOCK       = "1"
-    # The persistent prefill kernel has no material throughput gain on WDDM
-    # and can exceed the Windows watchdog interval on long prompts.
-    LLAMA_KV_HOST_RING_MMA_PREFILL_FSM           = "0"
+    LLAMA_KV_HOST_RING_MMA_PREFILL_FSM           = "1"
     LLAMA_KV_HOST_RING_MMA_INLINE_Q4             = "0"
     LLAMA_RS_TRANSACTION_LOG                     = "1"
     LLAMA_RS_PHASE_ARENA                         = "1"
@@ -79,7 +97,7 @@ $serverArguments = @(
     "--model", $modelPath,
     "--host", "127.0.0.1",
     "--port", $Port,
-    "--ctx-size", $Context,
+    "--ctx-size", $profileConfig.Context,
     "--parallel", "1",
     "--n-gpu-layers", "all",
     "--load-mode", "none",
@@ -103,7 +121,7 @@ $serverArguments = @(
     "--reasoning", "on",
     "--reasoning-format", "deepseek",
     "--reasoning-preserve",
-    "--ctx-checkpoints", "32",
+    "--ctx-checkpoints", $profileConfig.Checkpoints,
     "--no-mmproj",
     "--no-webui",
     "--log-verbosity", "1",
@@ -123,7 +141,9 @@ $serverArguments = @(
 Write-Host "Starting custom Qwen3.8 Blackwell runtime"
 Write-Host "  server:  $serverPath"
 Write-Host "  model:   $modelPath"
-Write-Host "  context: $Context"
+Write-Host "  profile: $Profile"
+Write-Host "  context: $($profileConfig.Context)"
+Write-Host "  hot KV:  $($profileConfig.HotTokens)"
 Write-Host "  port:    $Port"
 
 & $serverPath @serverArguments

@@ -1267,9 +1267,19 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
 
                     auto arg_open = p.tool_arg_open("<parameter=" + p.tool_arg_name(p.literal(param_name)) + ">\n");
 
-                    auto arg_value = schema_info.resolves_to_string(param_schema) ?
-                        arg_string :
+                    auto arg_json =
                         p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", param_schema)) + arg_close;
+
+                    auto arg_value = arg_json;
+                    if (schema_info.resolves_only_to_string(param_schema)) {
+                        arg_value = arg_string;
+                    } else if (schema_info.resolves_to_string(param_schema)) {
+                        // A union such as string|object must not collapse to the raw-string
+                        // parser. Prefer the schema-typed JSON branch so objects, arrays,
+                        // numbers, booleans and null retain their types, then fall back to
+                        // Qwen's unquoted XML string representation.
+                        arg_value = p.gbnf(p.atomic(arg_json | arg_string), "xml-arg-string");
+                    }
 
                     auto arg_rule = p.rule(rule_name, p.tool_arg(arg_open + arg_value));
 

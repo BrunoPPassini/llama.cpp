@@ -1227,6 +1227,80 @@ bool common_schema_info::resolves_to_string(const nlohmann::ordered_json & schem
     return check(schema);
 }
 
+// Returns true only when every explicit value alternative is a string. This
+// complements resolves_to_string(): Qwen needs raw XML text for string-only
+// arguments, while mixed unions must try their typed JSON alternatives first.
+bool common_schema_info::resolves_only_to_string(const nlohmann::ordered_json & schema) {
+    std::unordered_set<std::string> visited_refs;
+
+    std::function<bool(const json &)> check = [&](const json & s) -> bool {
+        if (!s.is_object()) {
+            return false;
+        }
+
+        if (s.contains("$ref")) {
+            const std::string & ref = s["$ref"];
+            if (!visited_refs.insert(ref).second) {
+                return false;
+            }
+            auto it = impl_->_refs.find(ref);
+            return it != impl_->_refs.end() && check(it->second);
+        }
+
+        if (s.contains("type")) {
+            const json & schema_type = s["type"];
+            if (schema_type.is_string()) {
+                return schema_type == "string";
+            }
+            if (schema_type.is_array() && !schema_type.empty()) {
+                for (const auto & type : schema_type) {
+                    if (type != "string") {
+                        return false;
+                    }
+                }
+                return true;
+            }
+        }
+
+        for (const char * alternatives : { "oneOf", "anyOf" }) {
+            if (s.contains(alternatives) && s[alternatives].is_array() && !s[alternatives].empty()) {
+                for (const auto & alt : s[alternatives]) {
+                    if (!check(alt)) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+        }
+
+        if (s.contains("allOf") && s["allOf"].is_array()) {
+            // An allOf is string-only as soon as one component restricts the
+            // intersection to strings. Other components may only add constraints.
+            for (const auto & component : s["allOf"]) {
+                if (check(component)) {
+                    return true;
+                }
+            }
+        }
+
+        if (s.contains("const")) {
+            return s["const"].is_string();
+        }
+        if (s.contains("enum") && s["enum"].is_array() && !s["enum"].empty()) {
+            for (const auto & value : s["enum"]) {
+                if (!value.is_string()) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        return s.contains("pattern") || s.contains("minLength") || s.contains("maxLength") || s.contains("format");
+    };
+
+    return check(schema);
+}
+
 std::string json_schema_to_grammar(const json & schema, bool force_gbnf) {
 #ifdef LLAMA_USE_LLGUIDANCE
     if (!force_gbnf) {
