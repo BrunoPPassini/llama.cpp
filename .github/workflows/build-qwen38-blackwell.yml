@@ -1,0 +1,126 @@
+name: Build Qwen3.8 Blackwell runtime
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Source branch or commit to build
+        required: true
+        default: qwen38-blackwell-256k
+        type: string
+      package:
+        description: Profile package to publish
+        required: true
+        default: both
+        type: choice
+        options:
+          - both
+          - hot-88k
+          - ring-256k
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qwen38-blackwell-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows-sm120:
+    name: Windows CUDA 13.3 sm_120a
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out custom source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_ref }}
+
+      - name: Install CUDA 13.3
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: "13.3"
+          cuda_arch: x64
+
+      - name: Install Ninja
+        run: choco install ninja --no-progress -y
+
+      - name: Configure
+        shell: cmd
+        run: >-
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          && cmake -S . -B build-blackwell -G "Ninja Multi-Config"
+          -DGGML_CUDA=ON
+          -DGGML_CUDA_FA_ALL_QUANTS=ON
+          -DGGML_CUDA_GRAPHS=ON
+          -DGGML_CUDA_FORCE_CUBLAS=OFF
+          -DGGML_CUDA_FORCE_MMQ=OFF
+          -DGGML_NATIVE=OFF
+          -DLLAMA_CURL=OFF
+          -DLLAMA_BUILD_TESTS=OFF
+          -DLLAMA_BUILD_EXAMPLES=OFF
+          -DCMAKE_CUDA_ARCHITECTURES=120a-real
+
+      - name: Build server
+        shell: cmd
+        run: >-
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          && cmake --build build-blackwell --config Release --target llama-server --parallel 4
+
+      - name: Validate custom runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $server = "build-blackwell\bin\Release\llama-server-mtpctx.exe"
+          if (-not (Test-Path -LiteralPath $server -PathType Leaf)) {
+              throw "Custom server was not produced: $server"
+          }
+          $help = & $server --help 2>&1 | Out-String
+          foreach ($requiredOption in @("--ctx-checkpoints", "--spec-type", "--reasoning-preserve")) {
+              if ($help -notmatch [regex]::Escape($requiredOption)) {
+                  throw "Required option missing from built server: $requiredOption"
+              }
+          }
+
+      - name: Assemble profile packages
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bin = Resolve-Path "build-blackwell\bin\Release"
+          $examples = Resolve-Path "examples\qwen38-blackwell"
+          New-Item -ItemType Directory -Force "artifacts" | Out-Null
+
+          foreach ($profile in @("hot-88k", "ring-256k")) {
+              $destination = Join-Path "artifacts" "qwen38-blackwell-$profile"
+              New-Item -ItemType Directory -Force $destination | Out-Null
+              Copy-Item -Path (Join-Path $bin "*") -Destination $destination -Recurse
+              Copy-Item -LiteralPath (Join-Path $examples "start-server.ps1") -Destination $destination
+              Copy-Item -LiteralPath (Join-Path $examples "start-$profile.ps1") -Destination $destination
+              Copy-Item -LiteralPath (Join-Path $examples "README.md") -Destination $destination
+
+              Get-ChildItem -LiteralPath $destination -File |
+                  Sort-Object Name |
+                  ForEach-Object {
+                      $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                      "$hash *$($_.Name)"
+                  } |
+                  Set-Content -LiteralPath (Join-Path $destination "SHA256SUMS.txt") -Encoding ascii
+          }
+
+      - name: Upload 88K hot package
+        if: inputs.package == 'both' || inputs.package == 'hot-88k'
+        uses: actions/upload-artifact@v6
+        with:
+          name: qwen38-blackwell-hot-88k-windows-sm120
+          path: artifacts/qwen38-blackwell-hot-88k
+          if-no-files-found: error
+          compression-level: 9
+
+      - name: Upload 256K ring package
+        if: inputs.package == 'both' || inputs.package == 'ring-256k'
+        uses: actions/upload-artifact@v6
+        with:
+          name: qwen38-blackwell-ring-256k-windows-sm120
+          path: artifacts/qwen38-blackwell-ring-256k
+          if-no-files-found: error
+          compression-level: 9
